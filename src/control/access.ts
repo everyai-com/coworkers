@@ -1,3 +1,4 @@
+import { DEFAULT_RULES } from "@/lib/types"
 import type { AccessLevel, ActionClass, RulePolicy } from "@/lib/types"
 import { LEVEL_RANK, fail, levelOf } from "./operation"
 import type { Caller, Failure, Operation, OperationContext } from "./operation"
@@ -40,22 +41,35 @@ export async function runOperation<I, O>(
 const POLICY_RANK: Record<RulePolicy, number> = { block: 0, ask: 1, allow: 2 }
 
 /**
- * Rules a caller may set: none looser than its own. The user has no
- * ceiling; outside clients get one once they can configure bots.
+ * Rules a caller may set: none looser than `rulesOf(caller)`. The user
+ * has no ceiling.
  */
 export function rulesCeiling(
   caller: Caller,
   rules: Partial<Record<ActionClass, RulePolicy>> | undefined
 ): Failure | null {
-  if (!rules || caller.kind !== "bot") return null
+  const ceiling = rulesOf(caller)
+  if (!rules || !ceiling) return null
   const looser = (Object.keys(rules) as ActionClass[]).filter(
-    (cls) => POLICY_RANK[rules[cls]!] > POLICY_RANK[caller.rules[cls]]
+    (cls) => POLICY_RANK[rules[cls]!] > POLICY_RANK[ceiling[cls]]
   )
   if (!looser.length) return null
   return fail(
     "ceiling",
     `Cannot set rules looser than your own: ${looser.join(", ")}.`
   )
+}
+
+/**
+ * The loosest rules a caller may hand out: a bot's own, the defaults for an
+ * outside agent (it has no rules of its own), none for the user.
+ */
+export function rulesOf(
+  caller: Caller
+): Record<ActionClass, RulePolicy> | null {
+  if (caller.kind === "bot") return caller.rules
+  if (caller.kind === "client") return DEFAULT_RULES
+  return null
 }
 
 /** Each class at the stricter of the two policies. */

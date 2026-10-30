@@ -115,6 +115,38 @@ export interface HubPort {
       files?: BotAttachment[]
     }
   ): Promise<Delivery>
+  /** An outside agent's message to a bot. `key` dedupes retries. */
+  messageFromClient(
+    client: ClientRef,
+    to: string,
+    text: string,
+    key: string
+  ): Promise<Delivery>
+  /** An outside agent hands a bot a task; its result waits for task_status. */
+  delegateFromClient(
+    client: ClientRef,
+    to: string,
+    task: string,
+    taskId: string
+  ): Promise<Delivery>
+  /** A task an outside agent handed out. Null when it is not that agent's. */
+  clientTask(clientId: string, taskId: string): Promise<ClientTask | null>
+}
+
+export interface ClientRef {
+  clientId: string
+  label: string
+}
+
+export interface ClientTask {
+  id: string
+  botId: string
+  botName: string
+  status: "open" | "done" | "failed" | "stopped"
+  result: string | null
+  error: string | null
+  createdAt: number
+  finishedAt: number | null
 }
 
 export type Delivery =

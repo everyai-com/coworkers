@@ -101,8 +101,10 @@ export function laneFor(origin: DeskOrigin): DeskLane | null {
     case "chat":
     case "settings":
       return "done"
-    // The pipeline's own run view reports these.
+    // The pipeline's own run view reports these, and an outside agent
+    // reports to whoever is using it.
     case "pipeline":
+    case "agent":
       return null
   }
 }
@@ -132,6 +134,8 @@ export function whyOf(origin: DeskOrigin, name: string) {
       return name ? `You asked: “${clip(plain(name), 90)}”` : "You asked"
     case "settings":
       return name
+    case "agent":
+      return `From ${name}`
   }
 }
 

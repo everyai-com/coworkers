@@ -3,7 +3,7 @@ import { botIdFromLink, botLink } from "@/lib/bot-links"
 import { isModelId } from "@/lib/models"
 import { ACTION_CLASSES, DEFAULT_RULES } from "@/lib/types"
 import type { ActionClass } from "@/lib/types"
-import { capRules, settingsCeiling } from "./access"
+import { capRules, rulesOf, settingsCeiling } from "./access"
 import { defineOperation, fail } from "./operation"
 import type { Caller } from "./operation"
 
@@ -44,7 +44,7 @@ export const messageBot = defineOperation({
   level: "act",
   effect: "write",
   actionClass: "bots",
-  // The sender is a bot until outside agents can message bots too.
+  // Outside agents have their own version: messageBotFromClient.
   callers: ["bot"],
   async run({ caller, self, hub, requestId }, { to, message, files = [] }) {
     if (caller.kind !== "bot" || !self) {
@@ -93,7 +93,8 @@ export const delegateTask = defineOperation({
   level: "act",
   effect: "write",
   actionClass: "bots",
-  // Results come back as a message, so the caller needs an inbox.
+  // Results come back as a message, so the caller needs an inbox. Outside
+  // agents have their own version: delegateTaskFromClient.
   callers: ["bot"],
   async run({ caller, self, hub, requestId }, { to, task, files = [] }) {
     if (caller.kind !== "bot" || !self) {
@@ -133,6 +134,123 @@ export const delegateTask = defineOperation({
     }
   },
 })
+
+// ── Outside agents (MCP clients) ────────────────────────────────────
+
+/** How long task_status may hold a request open, in seconds. */
+const MAX_TASK_WAIT_S = 50
+const TASK_POLL_MS = 2_000
+
+export const messageBotFromClient = defineOperation({
+  name: "message_bot",
+  description:
+    "Send one of the user's bots a message. It handles it in its own chat, where the user sees it came from you; you get no reply. For work whose result you need, use delegate_task.",
+  input: z.object({
+    to: z
+      .string()
+      .describe("The bot's link or id, from list_bots, or its name"),
+    message: z.string(),
+    clientRequestId: z
+      .string()
+      .max(100)
+      .optional()
+      .describe("The same value on a retry delivers the message once"),
+  }),
+  level: "act",
+  effect: "write",
+  callers: ["client"],
+  async run({ caller, hub, requestId }, { to, message, clientRequestId }) {
+    if (caller.kind !== "client")
+      return fail("unavailable", "For outside agents.")
+    const key = `client:${caller.clientId}:${clientRequestId ?? requestId ?? crypto.randomUUID()}`
+    const sent = await hub.messageFromClient(caller, to, message, key)
+    if (!sent.delivered) return fail(sent.code, sent.error)
+    return { delivered: true, to: sent.to, link: botLink(sent.botId) }
+  },
+})
+
+export const delegateTaskFromClient = defineOperation({
+  name: "delegate_task",
+  description:
+    "Hand one of the user's bots a task. Returns a taskId at once; call task_status with it (and `wait`) to get the result. The bot has not seen your conversation: give it the goal, what you know, and what to send back.",
+  input: z.object({
+    to: z
+      .string()
+      .describe("The bot's link or id, from list_bots, or its name"),
+    task: z.string(),
+    clientRequestId: z
+      .string()
+      .max(100)
+      .optional()
+      .describe("The same value on a retry hands out the task once"),
+  }),
+  level: "act",
+  effect: "write",
+  callers: ["client"],
+  async run({ caller, hub, requestId }, { to, task, clientRequestId }) {
+    if (caller.kind !== "client")
+      return fail("unavailable", "For outside agents.")
+    const seed = clientRequestId ?? requestId ?? crypto.randomUUID()
+    const taskId = `c${await shortHash(`${caller.clientId}:${seed}`)}`
+    const sent = await hub.delegateFromClient(caller, to, task, taskId)
+    if (!sent.delivered) return fail(sent.code, sent.error)
+    return {
+      delegated: true,
+      to: sent.to,
+      link: botLink(sent.botId),
+      taskId,
+      note: "Call task_status with this taskId and wait to get the result.",
+    }
+  },
+})
+
+export const taskStatus = defineOperation({
+  name: "task_status",
+  description: `Read a task you handed out with delegate_task. Pass \`wait\` (up to ${MAX_TASK_WAIT_S} seconds) to hold until it finishes; on "working", call again.`,
+  input: z.object({
+    taskId: z.string(),
+    wait: z
+      .number()
+      .int()
+      .min(0)
+      .max(MAX_TASK_WAIT_S)
+      .optional()
+      .describe("Seconds to wait for it to finish. Default 0."),
+  }),
+  level: "act",
+  effect: "read",
+  callers: ["client"],
+  async run({ caller, hub }, { taskId, wait = 0 }) {
+    if (caller.kind !== "client")
+      return fail("unavailable", "For outside agents.")
+    const until = Date.now() + wait * 1000
+    let row = await hub.clientTask(caller.clientId, taskId)
+    while (row?.status === "open" && Date.now() + TASK_POLL_MS <= until) {
+      await new Promise((resolve) => setTimeout(resolve, TASK_POLL_MS))
+      row = await hub.clientTask(caller.clientId, taskId)
+    }
+    if (!row) return fail("not_found", `No task "${taskId}" from you.`)
+    return {
+      taskId,
+      status: row.status === "open" ? "working" : row.status,
+      bot: { name: row.botName, link: botLink(row.botId) },
+      ...(row.result !== null ? { result: row.result } : {}),
+      ...(row.error !== null ? { error: row.error } : {}),
+    }
+  },
+})
+
+/** 20 hex characters of SHA-256: a stable id from a retry key. */
+async function shortHash(text: string) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(text)
+  )
+  return [...new Uint8Array(digest)]
+    .slice(0, 10)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+}
 
 /** A bot named by its link or id. */
 const botRef = z
@@ -231,13 +349,13 @@ export const createBot = defineOperation({
     const invalid = checkModel(input.model)
     if (invalid) return invalid
     // A bot cannot hand out the defaults where its own rules are stricter.
-    const patch =
-      caller.kind === "bot"
-        ? {
-            ...input,
-            rules: { ...capRules(DEFAULT_RULES, caller.rules), ...input.rules },
-          }
-        : input
+    const ceiling = rulesOf(caller)
+    const patch = ceiling
+      ? {
+          ...input,
+          rules: { ...capRules(DEFAULT_RULES, ceiling), ...input.rules },
+        }
+      : input
     const bot = await hub.addBot()
     if (Object.values(patch).some((v) => v !== undefined)) {
       await hub.configureBot(bot.id, patch)

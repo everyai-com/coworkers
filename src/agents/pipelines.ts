@@ -59,8 +59,16 @@ export function validatePipeline(
 }
 
 /** What a bot sees when another bot hands it a task. */
-export function delegationPrompt(from: string, task: string) {
-  return `[Task from the ${from} bot]\n${task}\n\nWhen you finish, your final reply is sent back to ${from} as the result.`
+export function delegationPrompt(
+  from: string,
+  task: string,
+  sender: "bot" | "agent" = "bot"
+) {
+  const header =
+    sender === "agent"
+      ? `[Task from ${from}, an outside agent the user connected]`
+      : `[Task from the ${from} bot]`
+  return `${header}\n${task}\n\nWhen you finish, your final reply is sent back to ${from} as the result.`
 }
 
 /** What a bot sees when it runs one step of a pipeline. */

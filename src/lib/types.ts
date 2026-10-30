@@ -420,6 +420,8 @@ export interface MessageOrigin {
     | "script"
     /** The user changed something the bot needs to know, like its access. */
     | "settings"
+    /** An outside agent the user connected over MCP, like Claude Code. */
+    | "agent"
   /** Bot, routine or pipeline name, email sender, webhook source, app name, crawled host, what a script was for, or what changed in settings. */
   name: string
   avatar?: BotAvatarKind
@@ -448,6 +450,8 @@ export interface MessageMeta {
 export type TaskReplyTo =
   | { kind: "bot"; botId: string }
   | { kind: "pipeline"; runId: string; step: number }
+  /** An outside agent over MCP: it reads the result with task_status. */
+  | { kind: "client"; clientId: string }
 
 /** Work handed to a bot whose final reply is sent back to whoever asked. */
 export interface BotTask {

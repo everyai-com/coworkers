@@ -18,6 +18,7 @@ import {
   CrawlIcon,
   EnvelopeSimpleIcon,
   PipelineIcon,
+  PlugsConnectedIcon,
   TerminalIcon,
   WebhooksLogoIcon,
 } from "@/components/icons"
@@ -649,6 +650,27 @@ function UserMessage({ message }: { message: UIMessage }) {
           <span className="inline-flex items-center gap-1.5 align-middle font-medium text-kumo-default">
             <BotAvatar avatar={origin.avatar ?? "blue-rectangle"} size={16} />
             {origin.name}
+          </span>
+        </SystemEvent>
+        <div className="w-fit max-w-[85%] rounded-[20px] border border-kumo-line px-4 py-2.5 break-words text-kumo-default">
+          <Prose text={stripOriginHeader(text)} />
+        </div>
+      </>
+    )
+  }
+  if (origin?.kind === "agent") {
+    const meta = message.metadata as MessageMeta | undefined
+    return (
+      <>
+        <SystemEvent>
+          <span className="inline-flex max-w-full items-center gap-1.5 align-middle">
+            <PlugsConnectedIcon size={14} className="shrink-0" />
+            <span className="truncate">
+              {meta?.task ? "Task from" : "Message from"}{" "}
+              <span className="font-medium text-kumo-default">
+                {origin.name}
+              </span>
+            </span>
           </span>
         </SystemEvent>
         <div className="w-fit max-w-[85%] rounded-[20px] border border-kumo-line px-4 py-2.5 break-words text-kumo-default">

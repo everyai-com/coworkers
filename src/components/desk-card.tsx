@@ -14,6 +14,7 @@ import {
   GearSixIcon,
   MessageIcon,
   PipelineIcon,
+  PlugsConnectedIcon,
   TerminalIcon,
   WebhooksLogoIcon,
 } from "@/components/icons"
@@ -36,6 +37,7 @@ const ORIGIN_ICONS: Record<DeskOrigin, React.ComponentType<IconProps>> = {
   pipeline: PipelineIcon,
   chat: MessageIcon,
   settings: GearSixIcon,
+  agent: PlugsConnectedIcon,
 }
 
 /** "just now", "12m", "3h", "Yesterday", "3 Oct". */

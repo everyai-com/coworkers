@@ -3,6 +3,7 @@ import { getAgentByName, routeAgentEmail, routeAgentRequest } from "agents"
 import { Unauthorized, identify } from "@/lib/auth"
 import { botInstanceName } from "@/lib/types"
 import { handleAppRequest } from "./agents/apps-runtime"
+import { handleOAuthRequest } from "./mcp/oauth"
 import type { UserHub } from "./agents/user-hub"
 
 // Durable Objects and the classes their runtimes load by name.
@@ -10,6 +11,8 @@ export { BotAgent, WorkspaceServiceProxy } from "./agents/bot-agent"
 export { UserHub } from "./agents/user-hub"
 // Apps bots build: live fan-out, and `env.BOT` inside an app's server.js.
 export { AppBinding, AppLive } from "./agents/apps-runtime"
+// OAuth clients, grants and tokens for outside agents on /mcp.
+export { OAuthStore } from "./mcp/oauth-store"
 // Backs `browser_execute`: a durable Code Mode runtime in a DO facet.
 export { CodemodeRuntime } from "agents/browser"
 
@@ -28,10 +31,15 @@ function ownsInstance(userId: string, agent: string, instance: string) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     // Apps authenticate by the link token in their URL, not the user.
     const app = await handleAppRequest(request, env)
     if (app) return app
+
+    // Outside agents: OAuth and /mcp carry their own tokens. The consent
+    // page among them checks Access itself.
+    const oauth = await handleOAuthRequest(request, env, ctx)
+    if (oauth) return oauth
 
     const target = agentInstance(new URL(request.url).pathname)
     if (target) {

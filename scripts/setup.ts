@@ -20,6 +20,20 @@ import { createInterface } from "node:readline/promises"
 import { MODELS, PROVIDERS } from "../src/lib/models.ts"
 
 const DEPLOY_FILE = "coworkers.deploy.json"
+/**
+ * Paths Access lets through: they carry their own tokens. Shared app links,
+ * webhooks, and what an MCP client calls on its own (`/oauth/authorize`,
+ * the consent page, stays behind Access). Keep in step with the installer.
+ */
+const BYPASS_PATHS = [
+  "/apps",
+  "/api/hooks",
+  "/mcp",
+  "/oauth/token",
+  "/oauth/register",
+  "/.well-known/oauth-authorization-server",
+  "/.well-known/oauth-protected-resource",
+]
 const LEGACY_DEPLOY_FILE = "bdots.deploy.json"
 const SECRETS_FILE = ".dev.vars.production"
 /** Access is required but nothing can pass it: the first deploy is closed. */
@@ -412,10 +426,10 @@ async function main() {
   await upsert("applications", accountId, apps, {
     type: "self_hosted",
     name: `coworkers ${name}: links`,
-    destinations: [
-      { type: "public", uri: `${host}/apps` },
-      { type: "public", uri: `${host}/api/hooks` },
-    ],
+    destinations: BYPASS_PATHS.map((path) => ({
+      type: "public",
+      uri: `${host}${path}`,
+    })),
     policies: [bypass.id],
     app_launcher_visible: false,
   })

@@ -5,10 +5,13 @@ import {
   createBot,
   deleteBot,
   delegateTask,
+  delegateTaskFromClient,
   listBots,
   messageBot,
+  messageBotFromClient,
   pauseBot,
   readBot,
+  taskStatus,
   updateBot,
 } from "./bots"
 import { runAsUser, visibleTo } from "./operations"
@@ -41,6 +44,17 @@ function fakeHub(patch: Partial<HubPort> = {}): HubPort {
       unread: false,
     })),
     setPaused: vi.fn(async () => true),
+    messageFromClient: vi.fn(async () => ({
+      delivered: true as const,
+      to: "Ada",
+      botId: "b9",
+    })),
+    delegateFromClient: vi.fn(async () => ({
+      delivered: true as const,
+      to: "Ada",
+      botId: "b9",
+    })),
+    clientTask: vi.fn(async () => null),
     removeBot: vi.fn(async () => {}),
     configureBot: vi.fn(async () => true),
     relayMessage: vi.fn(async () => ({
@@ -419,5 +433,110 @@ describe("list_bots and read_bot", () => {
       ok: false,
       code: "not_found",
     })
+  })
+})
+
+describe("outside agents", () => {
+  const agent = (level: "read" | "act" | "manage" = "act") =>
+    ({ kind: "client", clientId: "cl1", label: "Claude Code", level }) as const
+
+  it("see only their own tools, and nothing destructive", () => {
+    expect(visibleTo(agent("read")).map((op) => op.name)).toEqual([
+      "list_bots",
+      "read_bot",
+    ])
+    expect(visibleTo(agent("manage")).map((op) => op.name)).toEqual([
+      "message_bot",
+      "delegate_task",
+      "task_status",
+      "list_bots",
+      "read_bot",
+      "create_bot",
+      "update_bot",
+      "pause_bot",
+      "resume_bot",
+    ])
+  })
+
+  it("cannot loosen rules past the defaults", async () => {
+    expect(
+      await runOperation(updateBot, ctx({ caller: agent("manage") }), {
+        bot: "b2",
+        rules: { apps: "allow" },
+      })
+    ).toMatchObject({ ok: false, code: "ceiling" })
+  })
+
+  it("get the same task back on a retry", async () => {
+    const hub = fakeHub()
+    const input = { to: "Ada", task: "Sum it up", clientRequestId: "r1" }
+    const first = await runOperation(
+      delegateTaskFromClient,
+      ctx({ caller: agent(), hub }),
+      input
+    )
+    const second = await runOperation(
+      delegateTaskFromClient,
+      ctx({ caller: agent(), hub }),
+      input
+    )
+    expect(first).toMatchObject({ delegated: true, link: "coworkers://bot/b9" })
+    expect((first as { taskId: string }).taskId).toBe(
+      (second as { taskId: string }).taskId
+    )
+    expect(hub.delegateFromClient).toHaveBeenCalledWith(
+      expect.objectContaining({ clientId: "cl1", label: "Claude Code" }),
+      "Ada",
+      "Sum it up",
+      (first as { taskId: string }).taskId
+    )
+  })
+
+  it("message a bot with a stable key", async () => {
+    const hub = fakeHub()
+    await runOperation(messageBotFromClient, ctx({ caller: agent(), hub }), {
+      to: "Ada",
+      message: "hi",
+      clientRequestId: "r2",
+    })
+    expect(hub.messageFromClient).toHaveBeenCalledWith(
+      expect.objectContaining({ clientId: "cl1" }),
+      "Ada",
+      "hi",
+      "client:cl1:r2"
+    )
+  })
+
+  it("read a finished task", async () => {
+    const hub = fakeHub({
+      clientTask: vi.fn(async () => ({
+        id: "c1",
+        botId: "b9",
+        botName: "Ada",
+        status: "done" as const,
+        result: "Here it is",
+        error: null,
+        createdAt: 0,
+        finishedAt: 1,
+      })),
+    })
+    expect(
+      await runOperation(taskStatus, ctx({ caller: agent(), hub }), {
+        taskId: "c1",
+      })
+    ).toEqual({
+      taskId: "c1",
+      status: "done",
+      bot: { name: "Ada", link: "coworkers://bot/b9" },
+      result: "Here it is",
+    })
+  })
+
+  it("are told about a task that is not theirs", async () => {
+    expect(
+      await runOperation(taskStatus, ctx({ caller: agent() }), {
+        taskId: "nope",
+      })
+    ).toMatchObject({ ok: false, code: "not_found" })
   })
 })

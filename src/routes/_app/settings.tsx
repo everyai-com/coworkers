@@ -1,5 +1,6 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router"
 import { Tooltip } from "@cloudflare/kumo/components/tooltip"
+import { AgentsSettings } from "@/components/agents-settings"
 import { ConnectionsSettings } from "@/components/connections-settings"
 import { SidebarSimpleIcon } from "@/components/icons"
 import { ModelsSettings } from "@/components/models-settings"
@@ -11,6 +12,7 @@ const TABS = [
   { value: "models", label: "Models" },
   { value: "connections", label: "Connections" },
   { value: "spend", label: "Spend" },
+  { value: "agents", label: "Agents" },
 ] as const
 
 type Tab = (typeof TABS)[number]["value"]
@@ -19,7 +21,9 @@ export const Route = createFileRoute("/_app/settings")({
   validateSearch: (
     search: Record<string, unknown>
   ): { tab?: Tab; error?: string } => ({
-    ...(search.tab === "connections" || search.tab === "spend"
+    ...(search.tab === "connections" ||
+    search.tab === "spend" ||
+    search.tab === "agents"
       ? { tab: search.tab }
       : {}),
     // Set by the sign-in callback when an app's OAuth flow fails.
@@ -72,6 +76,8 @@ function Settings() {
             <ModelsSettings />
           ) : tab === "spend" ? (
             <SpendSettings />
+          ) : tab === "agents" ? (
+            <AgentsSettings />
           ) : (
             <ConnectionsSettings error={error} />
           )}

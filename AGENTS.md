@@ -10,19 +10,20 @@ TanStack Start, for Workers, and especially for the `cf` CLI.
 Coworkers is a multi-bot "AI teammates" app. Each bot is a
 Durable Object with its own chat, memory, routines, computer and browser.
 
-| Piece         | Where                                                                             | Notes                                                                                                                                                                             |
-| ------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Worker entry  | `src/server.ts`                                                                   | Auth-checks and routes `/agents/*`, then hands off to TanStack Start. Exports the Durable Object classes.                                                                         |
-| `UserHub`     | `src/agents/user-hub.ts`                                                          | One per user. Bot directory (sidebar), bot-to-bot relay, and every MCP connection (one sign-in per user; bots call tools through `appCatalog()` / `callAppTool()`).               |
-| `BotAgent`    | `src/agents/bot-agent.ts`                                                         | One per bot (`<userId>:<botId>`). Extends `Think`. Tools, rules, routines, computer, browser. Holds no MCP connections of its own.                                                |
-| Models        | `src/lib/models.ts`, `src/agents/models.ts`                                       | Model catalog (shared) and the AI Gateway model factory. Account choice on `UserHub`, per-bot override in `BotState.model`, Workers AI fallback.                                  |
-| System prompt | `src/agents/prompt.ts`                                                            | Stable "soul" plus per-turn context.                                                                                                                                              |
-| Desk          | `src/agents/desk.ts`, `src/routes/_app/index.tsx`, `src/components/desk-card.tsx` | Home screen of cards. Bots build them (`desk.ts`), the `UserHub` stores them (`desk_cards`) and closes approval cards once they are answered anywhere. Plan: `docs/desk-plan.md`. |
-| Operations    | `src/control/`                                                                    | One definition per action (bots, the browser, later `/mcp`): `runOperation` checks caller, level, approval and ceiling. Plan: `docs/mcp-plan.md`.                                 |
-| Shared types  | `src/lib/types.ts`                                                                | Imported by both the agents and the client. No server-only imports.                                                                                                               |
-| First paint   | `src/lib/server-fns.ts`                                                           | Server functions that read a snapshot over DO RPC.                                                                                                                                |
-| Live state    | `src/lib/hub-context.tsx`, `src/routes/_app/bots.$botId.tsx`                      | `useAgent` / `useAgentChat`, browser only, inside `ClientOnly`.                                                                                                                   |
-| Thread UI     | `src/components/thread.tsx`, `computer-card.tsx`, `src/lib/message-parts.ts`      | Tool parts become Computer cards, step lists, approval cards and system events.                                                                                                   |
+| Piece          | Where                                                                             | Notes                                                                                                                                                                             |
+| -------------- | --------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Worker entry   | `src/server.ts`                                                                   | Auth-checks and routes `/agents/*`, then hands off to TanStack Start. Exports the Durable Object classes.                                                                         |
+| `UserHub`      | `src/agents/user-hub.ts`                                                          | One per user. Bot directory (sidebar), bot-to-bot relay, and every MCP connection (one sign-in per user; bots call tools through `appCatalog()` / `callAppTool()`).               |
+| `BotAgent`     | `src/agents/bot-agent.ts`                                                         | One per bot (`<userId>:<botId>`). Extends `Think`. Tools, rules, routines, computer, browser. Holds no MCP connections of its own.                                                |
+| Models         | `src/lib/models.ts`, `src/agents/models.ts`                                       | Model catalog (shared) and the AI Gateway model factory. Account choice on `UserHub`, per-bot override in `BotState.model`, Workers AI fallback.                                  |
+| System prompt  | `src/agents/prompt.ts`                                                            | Stable "soul" plus per-turn context.                                                                                                                                              |
+| Desk           | `src/agents/desk.ts`, `src/routes/_app/index.tsx`, `src/components/desk-card.tsx` | Home screen of cards. Bots build them (`desk.ts`), the `UserHub` stores them (`desk_cards`) and closes approval cards once they are answered anywhere. Plan: `docs/desk-plan.md`. |
+| Operations     | `src/control/`                                                                    | One definition per action (bots, the browser, later `/mcp`): `runOperation` checks caller, level, approval and ceiling. Plan: `docs/mcp-plan.md`.                                 |
+| Outside agents | `src/mcp/`, `src/components/agents-settings.tsx`                                  | OAuth server, consent page (`/oauth/authorize`) and `/mcp` serving the operations to Claude Code, Codex and other MCP clients. Storage: the `OAuthStore` Durable Object.          |
+| Shared types   | `src/lib/types.ts`                                                                | Imported by both the agents and the client. No server-only imports.                                                                                                               |
+| First paint    | `src/lib/server-fns.ts`                                                           | Server functions that read a snapshot over DO RPC.                                                                                                                                |
+| Live state     | `src/lib/hub-context.tsx`, `src/routes/_app/bots.$botId.tsx`                      | `useAgent` / `useAgentChat`, browser only, inside `ClientOnly`.                                                                                                                   |
+| Thread UI      | `src/components/thread.tsx`, `computer-card.tsx`, `src/lib/message-parts.ts`      | Tool parts become Computer cards, step lists, approval cards and system events.                                                                                                   |
 
 Things that will bite you:
 
@@ -36,6 +37,9 @@ Things that will bite you:
   (connection header values live in a SQL table on the `UserHub`).
 - **WebSocket hooks cannot run during SSR.** Keep `useAgent` and
   `useAgentChat` under `ClientOnly`, with a loader-fed fallback.
+- **A new Durable Object class needs a `CLASS_HISTORY` entry** in
+  `installer/src/deploy/upload.ts`. Installer updates only create the
+  classes listed there after the Worker's migration tag.
 - **Never add the `experimental` compatibility flag.** `@cloudflare/computer`'s
   README asks for it, but Cloudflare rejects any deploy that sets it
   (error 10021), so nobody could deploy Coworkers.

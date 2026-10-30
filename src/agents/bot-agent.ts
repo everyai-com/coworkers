@@ -1523,6 +1523,11 @@ export class BotAgent extends Think<Env, BotState> {
       },
       relayMessage: async (...args) => (await hub()).relayMessage(...args),
       delegateTask: async (...args) => (await hub()).delegateTask(...args),
+      messageFromClient: async (...args) =>
+        (await hub()).messageFromClient(...args),
+      delegateFromClient: async (...args) =>
+        (await hub()).delegateFromClient(...args),
+      clientTask: async (...args) => (await hub()).clientTask(...args),
     }
   }
 
@@ -3976,6 +3981,18 @@ export class BotAgent extends Think<Env, BotState> {
         metadata,
       },
     })
+  }
+
+  /**
+   * Durable Object RPC from the UserHub: an outside agent the user
+   * connected over MCP (Claude Code, ChatGPT) sent this bot a message.
+   */
+  async receiveAgentMessage(label: string, text: string, key: string) {
+    await this.submitAs(
+      { kind: "agent", name: label },
+      `[Message from ${label}, an outside agent the user connected]\n${text}`,
+      { key }
+    )
   }
 
   /** Durable Object RPC from the UserHub: another bot is talking to this one. */

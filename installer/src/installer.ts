@@ -20,6 +20,8 @@ import type {
 interface Progress {
   subdomain?: string
   fresh?: boolean
+  /** The existing Worker's Durable Object migration tag, on an update. */
+  migrationTag?: string
   teamDomain?: string
   aud?: string
 }
@@ -36,6 +38,21 @@ class StepError extends Error {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * Paths Access lets through: they carry their own tokens. Shared app links,
+ * webhooks, and what an MCP client calls on its own. Keep in step with
+ * scripts/setup.ts.
+ */
+const BYPASS_PATHS = [
+  "/apps",
+  "/api/hooks",
+  "/mcp",
+  "/oauth/token",
+  "/oauth/register",
+  "/.well-known/oauth-authorization-server",
+  "/.well-known/oauth-protected-resource",
+]
 
 /** What a 403 on each step means, in the user's terms. */
 const DENIED: Record<StepId, string> = {
@@ -244,7 +261,13 @@ export class Installer extends Agent<Env, InstallerState> {
             "Go back and pick another name."
           )
         }
-        save({ subdomain, fresh: !script })
+        save({
+          subdomain,
+          fresh: !script,
+          ...(script?.migration_tag
+            ? { migrationTag: script.migration_tag }
+            : {}),
+        })
         this.setState({ ...this.state, updating: !!script })
         return script
           ? "Updating your existing coworkers"
@@ -300,6 +323,9 @@ export class Installer extends Agent<Env, InstallerState> {
           secrets,
           assetsJwt,
           fresh: progress.fresh ?? true,
+          ...(progress.migrationTag
+            ? { migrationTag: progress.migrationTag }
+            : {}),
         })
         return `coworkers ${release.release}`
       }
@@ -347,8 +373,10 @@ export class Installer extends Agent<Env, InstallerState> {
 
   /**
    * Access in front of Coworkers: an allow list for the app, and a bypass for
-   * the two paths outsiders use (shared app links and webhooks), which
-   * carry their own tokens.
+   * the paths outsiders use, which carry their own tokens: shared app links,
+   * webhooks, and what an MCP client calls on its own (`/mcp`, token and
+   * registration, discovery). The consent page, `/oauth/authorize`, stays
+   * behind Access.
    */
   private async configureAccess(
     api: CfApi,
@@ -414,10 +442,10 @@ export class Installer extends Agent<Env, InstallerState> {
     await api.upsertAccessApp(plan.accountId, appId(linksName), {
       type: "self_hosted",
       name: linksName,
-      destinations: [
-        { type: "public", uri: `${host}/apps` },
-        { type: "public", uri: `${host}/api/hooks` },
-      ],
+      destinations: BYPASS_PATHS.map((path) => ({
+        type: "public",
+        uri: `${host}${path}`,
+      })),
       policies: [bypass.id],
       app_launcher_visible: false,
     })

@@ -80,8 +80,52 @@ export async function uploadAssets(
 }
 
 /**
+ * Durable Object classes in the order Coworkers releases added them. A
+ * Worker on migration tag `vN` has the first N groups. Add a group (never
+ * edit one) when a release adds a class, or updates would never create it.
+ */
+export const CLASS_HISTORY: readonly (readonly string[])[] = [
+  ["UserHub", "BotAgent", "AppLive"],
+  // Outside agents over MCP: the OAuth server's storage.
+  ["OAuthStore"],
+]
+
+/**
+ * The migrations an upload carries: every class at once on a first
+ * install, and only the groups added since its tag on an update.
+ */
+export function migrationsFor(
+  classes: readonly string[],
+  target: { fresh: boolean; migrationTag?: string }
+) {
+  const known = new Set(CLASS_HISTORY.flat())
+  const unknown = classes.filter((name) => !known.has(name))
+  if (unknown.length > 0) {
+    throw new Error(
+      `CLASS_HISTORY does not list ${unknown.join(", ")}. Add them before packing a release.`
+    )
+  }
+  const latest = `v${CLASS_HISTORY.length}`
+  if (target.fresh) {
+    return { new_tag: latest, steps: [{ new_sqlite_classes: [...classes] }] }
+  }
+  // Installs from before the history was kept are all on v1.
+  const done = Number(/^v(\d+)$/.exec(target.migrationTag ?? "")?.[1] ?? 1)
+  if (done >= CLASS_HISTORY.length) return null
+  const steps = CLASS_HISTORY.slice(done)
+    .map((group) => group.filter((name) => classes.includes(name)))
+    .filter((group) => group.length > 0)
+    .map((group) => ({ new_sqlite_classes: group }))
+  return {
+    old_tag: target.migrationTag ?? "v1",
+    new_tag: latest,
+    steps,
+  }
+}
+
+/**
  * The script upload: every module, the bindings with the installer's
- * values filled in, and the Durable Object classes on a first install.
+ * values filled in, and the Durable Object classes it does not have yet.
  */
 export async function putScript(
   api: CfApi,
@@ -96,6 +140,8 @@ export async function putScript(
     secrets: Record<string, string>
     assetsJwt: string
     fresh: boolean
+    /** The deployed Worker's migration tag, on an update. */
+    migrationTag?: string
   }
 ) {
   const { worker } = release
@@ -119,6 +165,7 @@ export async function putScript(
     bindings.push({ type: "secret_text", name, text })
   }
 
+  const migrations = migrationsFor(worker.durableObjects, target)
   const metadata = {
     main_module: worker.mainModule,
     compatibility_date: worker.compatibilityDate,
@@ -129,16 +176,8 @@ export async function putScript(
     // Secrets set before (VAPID keys, a Browser Run token the user added)
     // survive an update.
     ...(target.fresh ? {} : { keep_bindings: ["secret_text"] }),
-    // The classes are created once. Updates carry no migrations, so the
-    // live tag stays put.
-    ...(target.fresh
-      ? {
-          migrations: {
-            new_tag: "v1",
-            steps: [{ new_sqlite_classes: worker.durableObjects }],
-          },
-        }
-      : {}),
+    // Classes are created once: an update only adds the ones it lacks.
+    ...(migrations ? { migrations } : {}),
     assets: { jwt: target.assetsJwt },
     annotations: { "workers/message": `coworkers ${release.release}` },
   }

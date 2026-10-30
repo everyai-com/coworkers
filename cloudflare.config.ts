@@ -60,6 +60,9 @@ export default defineConfig({
       BotAgent: exports.durableObject({ storage: "sqlite" }),
       // One per app a bot built: live updates to everyone who has it open.
       AppLive: exports.durableObject({ storage: "sqlite" }),
+      // One for the deployment: the OAuth server's clients, grants and
+      // tokens, for outside agents reaching Coworkers over /mcp.
+      OAuthStore: exports.durableObject({ storage: "sqlite" }),
     },
     env: {
       // Workers AI + AI Gateway for all model traffic. Neither this nor
@@ -93,6 +96,10 @@ export default defineConfig({
       AppLive: bindings.durableObject({
         worker: WORKER_NAME,
         exportName: "AppLive",
+      }),
+      OAuthStore: bindings.durableObject({
+        worker: WORKER_NAME,
+        exportName: "OAuthStore",
       }),
       // Deployment default chat model. Users pick others (Workers AI,
       // Anthropic, OpenAI, Google, xAI) on the Models page and per bot;

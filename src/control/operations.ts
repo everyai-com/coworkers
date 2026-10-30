@@ -4,12 +4,15 @@ import { runOperation } from "./access"
 import {
   createBot,
   delegateTask,
+  delegateTaskFromClient,
   deleteBot,
   listBots,
   messageBot,
+  messageBotFromClient,
   pauseBot,
   readBot,
   resumeBot,
+  taskStatus,
   updateBot,
 } from "./bots"
 import { LEVEL_RANK, isFailure, levelOf } from "./operation"
@@ -24,6 +27,9 @@ import type {
 export const OPERATIONS = [
   messageBot,
   delegateTask,
+  messageBotFromClient,
+  delegateTaskFromClient,
+  taskStatus,
   listBots,
   readBot,
   createBot,
@@ -35,12 +41,17 @@ export const OPERATIONS = [
 
 export type OperationName = (typeof OPERATIONS)[number]["name"]
 
-/** The operations a caller would see: allowed for its kind and level. */
+/**
+ * The operations a caller would see: allowed for its kind and level. An
+ * outside agent sees no destructive ones: it has no approval card to
+ * stop at, so those stay with the user in Coworkers.
+ */
 export function visibleTo(caller: Caller): AnyOperation[] {
   return (OPERATIONS as readonly AnyOperation[]).filter(
     (op) =>
       (!op.callers || op.callers.includes(caller.kind)) &&
-      LEVEL_RANK[levelOf(caller)] >= LEVEL_RANK[op.level]
+      LEVEL_RANK[levelOf(caller)] >= LEVEL_RANK[op.level] &&
+      !(caller.kind === "client" && op.effect === "destructive")
   )
 }
 

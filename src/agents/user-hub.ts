@@ -29,6 +29,8 @@ import * as ops from "@/control/bots"
 import { runAsUser } from "@/control/operations"
 import type {
   BotSettingsPatch,
+  ClientRef,
+  ClientTask,
   Delivery,
   FailureCode,
   HubPort,
@@ -72,6 +74,10 @@ const MAX_PIPELINES = 50
 const MAX_PIPELINE_RUNS = 30
 /** A step's output as broadcast to the browser; the full text stays in SQL. */
 const MAX_STEP_OUTPUT_IN_STATE = 4_000
+/** A finished task's result kept for an outside agent's task_status. */
+const MAX_CLIENT_RESULT_CHARS = 100_000
+/** Tasks outside agents handed out are forgotten after this long. */
+const CLIENT_TASK_KEEP_MS = 7 * 24 * 3_600_000
 /** SQLite rows top out at 2 MB; bigger files are not passed between steps. */
 const MAX_STORED_FILE_BYTES = 1_900_000
 
@@ -125,6 +131,22 @@ export class UserHub extends Agent<Env, HubState> implements HubPort {
       output TEXT NOT NULL,
       PRIMARY KEY (run_id, step)
     )`
+    // Tasks outside agents (MCP clients) handed out, until they read the
+    // result with task_status.
+    this.sql`CREATE TABLE IF NOT EXISTS client_tasks (
+      id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      bot_id TEXT NOT NULL,
+      bot_name TEXT NOT NULL,
+      task TEXT NOT NULL,
+      status TEXT NOT NULL,
+      result TEXT,
+      error TEXT,
+      created_at INTEGER NOT NULL,
+      finished_at INTEGER
+    )`
+    this
+      .sql`DELETE FROM client_tasks WHERE created_at < ${Date.now() - CLIENT_TASK_KEEP_MS}`
     this.sql`CREATE TABLE IF NOT EXISTS pipeline_files (
       run_id TEXT NOT NULL,
       step INTEGER NOT NULL,
@@ -1222,24 +1244,34 @@ export class UserHub extends Agent<Env, HubState> implements HubPort {
     | { from: BotSummary; target: BotSummary }
     | { code: FailureCode; error: string } {
     const from = this.state.bots.find((b) => b.id === fromBotId)
+    if (!from) return { code: "not_found", error: "Unknown sender" }
+    const found = this.target(to, fromBotId)
+    if ("error" in found) return found
+    if (found.target.id === fromBotId) {
+      return { code: "invalid", error: "A bot cannot message itself" }
+    }
+    return { from, target: found.target }
+  }
+
+  /** The bot `to` names (link, id or name), if it can take work now. */
+  private target(
+    to: string,
+    exceptId?: string
+  ): { target: BotSummary } | { code: FailureCode; error: string } {
     const needle = (botIdFromLink(to) ?? to.trim().replace(/^@/, ""))
       .trim()
       .toLowerCase()
     const target = this.state.bots.find(
       (b) => b.id === needle || b.name.toLowerCase() === needle
     )
-    if (!from) return { code: "not_found", error: "Unknown sender" }
     if (!target) {
       const names = this.state.bots
-        .filter((b) => b.id !== fromBotId)
+        .filter((b) => b.id !== exceptId)
         .map((b) => `${b.name} (${b.id})`)
       return {
         code: "not_found",
         error: `No bot named "${to}". Available: ${names.join(", ") || "none"}`,
       }
-    }
-    if (target.id === fromBotId) {
-      return { code: "invalid", error: "A bot cannot message itself" }
     }
     if (target.paused) {
       return {
@@ -1247,7 +1279,89 @@ export class UserHub extends Agent<Env, HubState> implements HubPort {
         error: `${target.name} is paused. Do the work yourself, or ask the user to resume it.`,
       }
     }
-    return { from, target }
+    return { target }
+  }
+
+  // ── Outside agents (MCP clients) ────────────────────────────────────
+
+  async messageFromClient(
+    client: ClientRef,
+    to: string,
+    text: string,
+    key: string
+  ): Promise<Delivery> {
+    const found = this.target(to)
+    if ("error" in found) return { delivered: false, ...found }
+    const { target } = found
+    const bot = await this.bot(target.id)
+    await bot.receiveAgentMessage(client.label, text, key)
+    return { delivered: true, to: target.name, botId: target.id }
+  }
+
+  async delegateFromClient(
+    client: ClientRef,
+    to: string,
+    task: string,
+    taskId: string
+  ): Promise<Delivery> {
+    const found = this.target(to)
+    if ("error" in found) return { delivered: false, ...found }
+    const { target } = found
+    // A retry with the same request id gets the task it already started.
+    const existing = this.sql<{ bot_id: string; bot_name: string }>`
+      SELECT bot_id, bot_name FROM client_tasks
+      WHERE id = ${taskId} AND client_id = ${client.clientId}`[0]
+    if (existing) {
+      return { delivered: true, to: existing.bot_name, botId: existing.bot_id }
+    }
+    this.sql`INSERT INTO client_tasks
+      (id, client_id, bot_id, bot_name, task, status, created_at)
+      VALUES (${taskId}, ${client.clientId}, ${target.id}, ${target.name},
+              ${clip(task, 4_000)}, 'open', ${Date.now()})`
+    const bot = await this.bot(target.id)
+    await bot.receiveTask(
+      { kind: "agent", name: client.label },
+      delegationPrompt(client.label, task, "agent"),
+      {
+        task: {
+          id: taskId,
+          replyTo: { kind: "client", clientId: client.clientId },
+        },
+        key: `client-task:${taskId}`,
+        hops: 1,
+        // Not background: approvals it needs reach the user as Needs-you
+        // cards instead of the work being blocked.
+        background: false,
+      }
+    )
+    return { delivered: true, to: target.name, botId: target.id }
+  }
+
+  async clientTask(
+    clientId: string,
+    taskId: string
+  ): Promise<ClientTask | null> {
+    const row = this.sql<{
+      id: string
+      bot_id: string
+      bot_name: string
+      status: ClientTask["status"]
+      result: string | null
+      error: string | null
+      created_at: number
+      finished_at: number | null
+    }>`SELECT * FROM client_tasks WHERE id = ${taskId} AND client_id = ${clientId}`[0]
+    if (!row) return null
+    return {
+      id: row.id,
+      botId: row.bot_id,
+      botName: row.bot_name,
+      status: row.status,
+      result: row.result,
+      error: row.error,
+      createdAt: row.created_at,
+      finishedAt: row.finished_at,
+    }
   }
 
   /** A bot hands another a task; the result comes back through `completeTask`. */
@@ -1289,6 +1403,14 @@ export class UserHub extends Agent<Env, HubState> implements HubPort {
     const { replyTo } = task
     if (replyTo.kind === "pipeline") {
       await this.finishBotStep(replyTo.runId, replyTo.step, botId, outcome)
+      return
+    }
+    if (replyTo.kind === "client") {
+      // Waits here for the agent's task_status.
+      this.sql`UPDATE client_tasks SET status = ${outcome.status},
+        result = ${clip(outcome.result, MAX_CLIENT_RESULT_CHARS)},
+        error = ${outcome.error ?? null}, finished_at = ${Date.now()}
+        WHERE id = ${task.id} AND client_id = ${replyTo.clientId}`
       return
     }
     if (!this.state.bots.some((b) => b.id === replyTo.botId)) return

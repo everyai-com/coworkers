@@ -200,33 +200,49 @@ starter rules). It needs nothing special in the code:
 
 ## Transport and auth for outside agents
 
-Uses `@cloudflare/workers-oauth-provider` 2.x
-(`https://developers.cloudflare.com/agents/model-context-protocol/protocol/authorization/index.md`):
+Built with `@cloudflare/workers-oauth-provider` (1.2), both roles in this
+Worker (`src/mcp/`):
 
-- **Authorization server.** `OAuthAuthorizationServer` serves discovery,
-  client registration (Client ID Metadata Documents, plus DCR for older
-  clients) and `/oauth/token`. Grants live in a KV namespace bound as
-  `OAUTH_KV`. Create it with `cf` and put its `id` in
-  `cloudflare.config.ts` (rule 2). CIMD also needs the
-  `global_fetch_strictly_public` compatibility flag. That is a regular
-  flag, not `experimental`.
-- **`/authorize` is ours** and sits behind Access, so `identify()` already
-  knows the user. The consent page names the client and where approval
-  goes, and asks for an access level (Read only, the default; Act; Manage).
-  `completeAuthorization()` stores `props: { userId, level, label }`.
-- **Resource server.** `OAuthResourceServer` around `createMcpHandler`
-  from `agents/mcp/server` at `/mcp`. The server factory reads
-  `getMcpAuthContext()` and registers only the operations the token's level
-  allows. Each tool calls `hub.runOperation({ kind: "client", … }, …)` on
-  the token's user hub.
-- **Access bypass.** MCP clients can't carry an Access JWT, so the
-  installer's bypass app adds `/mcp`, `/.well-known/oauth-*`,
-  `/oauth/token` and `/oauth/register`. `/authorize` stays behind Access,
-  which is what keeps it safe.
-- **Without Access** (dev, demo), `/authorize` signs in as the demo user,
-  as the rest of the app does.
-- **Settings → Connected agents** lists each client with its level and last
-  use, with Revoke. Sign-ins last 30 days.
+- **Authorization server.** `OAuthAuthorizationServer`, one per origin
+  (the issuer is whatever URL the request came in on), serves discovery,
+  Dynamic Client Registration (`/oauth/register`) and `/oauth/token`.
+  Client ID Metadata Documents are off: they need the
+  `global_fetch_strictly_public` flag, which breaks `http://localhost`
+  connections in dev.
+- **Storage without KV.** The library wants a KV namespace bound as
+  `OAUTH_KV`. A SQLite Durable Object (`OAuthStore`, one instance) behind
+  a KV-shaped adapter stands in, so installs need no new resource and the
+  installer no new OAuth scope.
+- **Consent page** at `/oauth/authorize`, behind Access, so `identify()`
+  knows the user. It names the client (flagged as unverified for DCR
+  clients), where access goes, warns for a local app, and asks for a
+  level: Read only (default), Work with your bots, Manage your bots.
+  `completeAuthorization()` stores `props: { userId, level, label }`; the
+  scopes are `coworkers.read` / `.act` / `.manage` plus `offline_access`.
+- **Resource server.** `OAuthResourceServer` in front of `/mcp`, which
+  builds an `McpServer` per request from `visibleTo(client caller)`. The
+  operations run in the Worker against the user's hub over DO RPC. The
+  effective level is the lower of the grant and the token's scopes.
+- **What agents get.** `list_bots`, `read_bot`; with act, their own
+  `message_bot` and `delegate_task` (no workspace files; results wait in
+  the hub's `client_tasks` for `task_status`, which can wait up to 50 s);
+  with manage, `create_bot`, `update_bot`, `pause_bot`, `resume_bot`. No
+  destructive operation is shown to an agent: there is no approval card to
+  stop at yet, so deleting stays with the user. Rules an agent sets can't
+  be looser than the defaults. A retry with the same `clientRequestId`
+  delivers once.
+- **Access bypass.** `/mcp`, `/oauth/token`, `/oauth/register` and the two
+  `/.well-known/oauth-*` documents, in both the installer and `pnpm run
+setup`. `/oauth/authorize` stays behind Access.
+- **Without Access** (dev, demo) the consent page signs in as the demo
+  user, as the rest of the app does.
+- **Settings → Agents** shows the MCP URL with Claude Code and Codex
+  commands, lists connected agents with their level, and disconnects
+  (revokes the grant; its tokens stop at once). A connection lapses after
+  30 days unused.
+- **Installer migrations.** Updates used to carry no Durable Object
+  migrations; `CLASS_HISTORY` in `installer/src/deploy/upload.ts` now
+  adds the classes an install lacks (`v1` → `v2` adds `OAuthStore`).
 
 ## Build order
 
@@ -248,9 +264,13 @@ Uses `@cloudflare/workers-oauth-provider` 2.x
    `propertyNames` is JSON Schema some providers reject.
 4. **Outside agents.** OAuth server, consent page, `/mcp`, the Access
    bypass in the installer, `task_status`, pending-approval results and the
-   Connected agents settings.
-5. **Later.** Per-task `model`, settings and connection operations,
-   pipelines over MCP, a `coworkers` CLI on the same operations.
+   Connected agents settings. **Done**, without pending-approval results:
+   destructive operations are hidden from agents for now. Checked end to
+   end locally with a scripted MCP client (registration, consent in the
+   browser, token, tools, revoke).
+5. **Later.** Approval cards for an agent's destructive calls, CIMD,
+   per-task `model`, settings and connection operations, pipelines over
+   MCP, a `coworkers` CLI on the same operations.
 
 ## Files
 
@@ -270,10 +290,8 @@ Uses `@cloudflare/workers-oauth-provider` 2.x
 
 ## Decisions to make
 
-1. **One Worker or two.** The docs show the authorization server as its
-   own Worker behind a Service Binding. Recommended: keep it in this Worker
-   and call `validateToken` directly, if the 2.x API allows that. Check
-   before building step 4.
+1. **One Worker or two.** Decided: one. The library supports both roles in
+   one Worker, with `validateToken` called directly.
 2. **Approvals for outside agents.** A Desk card plus `pending_approval`
    (works in every client) or MCP elicitation (support varies by client).
    Recommended: the Desk card.
