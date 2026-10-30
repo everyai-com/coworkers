@@ -4,6 +4,7 @@ import { generateText } from "ai"
 import webpush from "web-push"
 import { DEFAULT_MODEL_SETTINGS, isModelId } from "@/lib/models"
 import type { ModelSettings, ModelTestResult } from "@/lib/models"
+import { botIdFromLink } from "@/lib/bot-links"
 import { BOT_AVATARS, NEW_BOT_NAME, botInstanceName } from "@/lib/types"
 import type {
   AppCatalog,
@@ -24,6 +25,14 @@ import type {
   SpendSummary,
   TaskOutcome,
 } from "@/lib/types"
+import * as ops from "@/control/bots"
+import { runAsUser } from "@/control/operations"
+import type {
+  BotSettingsPatch,
+  Delivery,
+  FailureCode,
+  HubPort,
+} from "@/control/operation"
 import type { BotAgent } from "./bot-agent"
 import { demoSeed } from "./demo-seed"
 import { visibleCards } from "./desk"
@@ -93,7 +102,7 @@ const SPEND_KEEP_DAYS = 62
  * `@callable()` methods are invoked by the browser over the agent
  * WebSocket. Plain public methods are Durable Object RPC, called by bots.
  */
-export class UserHub extends Agent<Env, HubState> {
+export class UserHub extends Agent<Env, HubState> implements HubPort {
   initialState: HubState = {
     bots: [],
     connections: [],
@@ -355,10 +364,9 @@ export class UserHub extends Agent<Env, HubState> {
     })
   }
 
-  // ── Browser-facing ──────────────────────────────────────────────────
+  // ── Bots (operations in src/control/bots.ts) ─────────────────────────
 
-  @callable()
-  async createBot(): Promise<BotSummary> {
+  async addBot(): Promise<BotSummary> {
     // Each bot gets its own shape until the roster runs out.
     const taken = new Set(this.state.bots.map((b) => b.avatar))
     const avatar =
@@ -380,8 +388,7 @@ export class UserHub extends Agent<Env, HubState> {
     return summary
   }
 
-  @callable()
-  async deleteBot(botId: string) {
+  async removeBot(botId: string) {
     // Drop it from the directory first: `destroy()` aborts the bot's isolate,
     // so calls to it reject ("destroyed") even when the teardown went through.
     // That includes the lookup, which calls the bot too, so neither may fail
@@ -404,8 +411,59 @@ export class UserHub extends Agent<Env, HubState> {
       const bot = await this.bot(botId)
       await bot.destroy()
     } catch (err) {
-      console.warn(`deleteBot ${botId}: teardown reported`, err)
+      console.warn(`removeBot ${botId}: teardown reported`, err)
     }
+  }
+
+  async configureBot(botId: string, patch: BotSettingsPatch) {
+    if (!this.state.bots.some((b) => b.id === botId)) return false
+    const bot = await this.bot(botId)
+    await bot.applySettings(patch)
+    return true
+  }
+
+  async setPaused(botId: string, paused: boolean) {
+    if (!this.state.bots.some((b) => b.id === botId)) return false
+    this.patchBot(botId, { paused })
+    const bot = await this.bot(botId)
+    await bot.setPaused(paused)
+    return true
+  }
+
+  async readBot(botId: string, limit: number) {
+    const summary = this.state.bots.find((b) => b.id === botId)
+    if (!summary) return null
+    const bot = await this.bot(botId)
+    return { name: summary.name, messages: await bot.transcript(limit) }
+  }
+
+  // ── Browser-facing ──────────────────────────────────────────────────
+
+  @callable()
+  async createBot(): Promise<BotSummary> {
+    return (await runAsUser(ops.createBot, { hub: this }, {})).bot
+  }
+
+  /** Onboarding's first bot: one that sets up and runs the others. */
+  @callable()
+  async createChiefOfStaff(): Promise<BotSummary> {
+    return (await runAsUser(ops.createBot, { hub: this }, ops.CHIEF_OF_STAFF))
+      .bot
+  }
+
+  @callable()
+  async deleteBot(botId: string) {
+    await runAsUser(ops.deleteBot, { hub: this }, { bot: botId })
+  }
+
+  @callable()
+  async pauseBot(botId: string) {
+    await runAsUser(ops.pauseBot, { hub: this }, { bot: botId })
+  }
+
+  @callable()
+  async resumeBot(botId: string) {
+    await runAsUser(ops.resumeBot, { hub: this }, { bot: botId })
   }
 
   @callable()
@@ -699,7 +757,12 @@ export class UserHub extends Agent<Env, HubState> {
   /** A bot reports its own status, preview, or new name. */
   async reportBot(
     botId: string,
-    patch: Partial<Pick<BotSummary, "name" | "status" | "preview" | "unread">>
+    patch: Partial<
+      Pick<
+        BotSummary,
+        "name" | "status" | "preview" | "unread" | "role" | "access" | "paused"
+      >
+    >
   ) {
     const touched = patch.preview !== undefined || patch.name !== undefined
     this.patchBot(botId, {
@@ -852,7 +915,7 @@ export class UserHub extends Agent<Env, HubState> {
     if (this.userId !== "jane") {
       throw new Error("Demo data only goes in the local demo profile.")
     }
-    for (const bot of [...this.state.bots]) await this.deleteBot(bot.id)
+    for (const bot of [...this.state.bots]) await this.removeBot(bot.id)
     this.sql`DELETE FROM desk_cards`
     const now = Date.now()
     const seed = demoSeed(now)
@@ -1133,14 +1196,9 @@ export class UserHub extends Agent<Env, HubState> {
     to: string,
     text: string,
     delivery: { key?: string; hops?: number; files?: BotAttachment[] } = {}
-  ): Promise<{
-    delivered: boolean
-    to?: string
-    error?: string
-    files?: string[]
-  }> {
+  ): Promise<Delivery & { files?: string[] }> {
     const found = this.recipient(fromBotId, to)
-    if ("error" in found) return { delivered: false, error: found.error }
+    if ("error" in found) return { delivered: false, ...found }
     const { from, target } = found
     const bot = await this.bot(target.id)
     const saved = await bot.receiveBotMessage(
@@ -1151,31 +1209,43 @@ export class UserHub extends Agent<Env, HubState> {
     return {
       delivered: true,
       to: target.name,
+      botId: target.id,
       ...(saved.length ? { files: saved } : {}),
     }
   }
 
-  /** The sender and the bot it named (by name or id), for bot-to-bot calls. */
+  /** The sender and the bot it named (by link, id or name), for bot-to-bot calls. */
   private recipient(
     fromBotId: string,
     to: string
-  ): { from: BotSummary; target: BotSummary } | { error: string } {
+  ):
+    | { from: BotSummary; target: BotSummary }
+    | { code: FailureCode; error: string } {
     const from = this.state.bots.find((b) => b.id === fromBotId)
-    const needle = to.trim().toLowerCase()
+    const needle = (botIdFromLink(to) ?? to.trim().replace(/^@/, ""))
+      .trim()
+      .toLowerCase()
     const target = this.state.bots.find(
       (b) => b.id === needle || b.name.toLowerCase() === needle
     )
-    if (!from) return { error: "Unknown sender" }
+    if (!from) return { code: "not_found", error: "Unknown sender" }
     if (!target) {
       const names = this.state.bots
         .filter((b) => b.id !== fromBotId)
-        .map((b) => b.name)
+        .map((b) => `${b.name} (${b.id})`)
       return {
+        code: "not_found",
         error: `No bot named "${to}". Available: ${names.join(", ") || "none"}`,
       }
     }
     if (target.id === fromBotId) {
-      return { error: "A bot cannot message itself" }
+      return { code: "invalid", error: "A bot cannot message itself" }
+    }
+    if (target.paused) {
+      return {
+        code: "paused",
+        error: `${target.name} is paused. Do the work yourself, or ask the user to resume it.`,
+      }
     }
     return { from, target }
   }
@@ -1192,9 +1262,9 @@ export class UserHub extends Agent<Env, HubState> {
       background: boolean
       files?: BotAttachment[]
     }
-  ): Promise<{ delivered: boolean; to?: string; error?: string }> {
+  ): Promise<Delivery> {
     const found = this.recipient(fromBotId, to)
-    if ("error" in found) return { delivered: false, error: found.error }
+    if ("error" in found) return { delivered: false, ...found }
     const { from, target } = found
     const bot = await this.bot(target.id)
     await bot.receiveTask(
@@ -1211,7 +1281,7 @@ export class UserHub extends Agent<Env, HubState> {
         ...(delivery.files ? { files: delivery.files } : {}),
       }
     )
-    return { delivered: true, to: target.name }
+    return { delivered: true, to: target.name, botId: target.id }
   }
 
   /** A bot finished a task: send the result to whoever handed it out. */
@@ -1430,6 +1500,10 @@ export class UserHub extends Agent<Env, HubState> {
     const bot = this.state.bots.find((b) => b.id === step.botId)
     if (!bot) {
       await this.failStep(runId, index, "Its bot was deleted.")
+      return
+    }
+    if (bot.paused) {
+      await this.failStep(runId, index, `${bot.name} is paused.`)
       return
     }
     this.patchStep(runId, index, {

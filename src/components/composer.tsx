@@ -16,10 +16,17 @@ import {
   WarningIcon,
   XIcon,
 } from "@/components/icons"
+import { BotAvatar } from "@/components/bot-avatar"
+import { linkMentions, mentionQuery } from "@/lib/bot-links"
+import type { BotSummary } from "@/lib/types"
 
 const TEACH_PROMPT = "I want to show you how to "
 /** Tallest the message field grows before it scrolls. */
 const FIELD_MAX = 200
+/** Bots the @ picker lists at once. */
+const MAX_MENTION_OPTIONS = 6
+
+export type MentionBot = Pick<BotSummary, "id" | "name" | "avatar">
 
 interface ComposerProps {
   botName: string
@@ -30,6 +37,8 @@ interface ComposerProps {
   onStop: () => void
   /** Saves a file to the bot's inbox and returns its workspace path. */
   onAttach?: (file: File) => Promise<string>
+  /** Other bots, for @mentions. Absent: no picker. */
+  bots?: MentionBot[]
 }
 
 interface Attachment {
@@ -53,6 +62,29 @@ function baseName(name: string) {
 }
 
 const ARCHIVES = new Set(["zip", "gz", "tar", "tgz", "rar", "7z"])
+
+/** Bots whose name matches what follows the @, names starting with it first. */
+function matchBots(bots: MentionBot[], query: string) {
+  // After a space only a longer name can still match ("Sales " → "Sales
+  // Lead"). That also closes the list once a pick has added its space.
+  if (/\s$/.test(query)) {
+    const prefix = query.toLowerCase()
+    return bots
+      .filter((b) => b.name.toLowerCase().startsWith(prefix))
+      .slice(0, MAX_MENTION_OPTIONS)
+  }
+  const q = query.trim().toLowerCase()
+  const starts = (b: MentionBot) =>
+    b.name.toLowerCase().startsWith(q) ||
+    b.name
+      .toLowerCase()
+      .split(/\s+/)
+      .some((word) => word.startsWith(q))
+  return bots
+    .filter((b) => b.name.toLowerCase().includes(q))
+    .sort((a, b) => Number(starts(b)) - Number(starts(a)))
+    .slice(0, MAX_MENTION_OPTIONS)
+}
 
 function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
@@ -182,8 +214,10 @@ export function Composer({
   onSend,
   onStop,
   onAttach,
+  bots,
 }: ComposerProps) {
   const [text, setText] = useState("")
+  const [caret, setCaret] = useState(0)
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [multiline, setMultiline] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -191,6 +225,25 @@ export function Composer({
   const textarea = useRef<HTMLTextAreaElement>(null)
   const inner = useRef<HTMLDivElement>(null)
   const [height, setHeight] = useState<number>()
+
+  // The @ picker: open while the text before the caret is "@" plus part of
+  // a bot's name. Escape closes it until the next @.
+  const [dismissedAt, setDismissedAt] = useState<number | null>(null)
+  const [active, setActive] = useState(0)
+  /** Bots picked from the list, so a shared name links to the one chosen. */
+  const picked = useRef(new Map<string, string>())
+  const mention = bots?.length ? mentionQuery(text, caret) : null
+  const options =
+    mention && dismissedAt !== mention.start
+      ? matchBots(bots ?? [], mention.query)
+      : []
+  const picking = options.length > 0
+  useEffect(() => setActive(0), [mention?.start, mention?.query])
+  // Leaving the @ (deleting it, moving away) forgets an Escape.
+  const inMention = mention !== null
+  useEffect(() => {
+    if (!inMention) setDismissedAt(null)
+  }, [inMention])
 
   const uploading = attachments.some((a) => a.status === "uploading")
   const ready = attachments.filter((a) => a.status === "ready")
@@ -280,10 +333,35 @@ export function Composer({
     const files = ready.length
       ? `\n\nAttached files: ${ready.map((a) => a.path).join(", ")}`
       : ""
-    onSend((text.trim() + files).trim())
+    // Typed or picked, every @Name of another bot goes out as its link.
+    const choices = (bots ?? []).filter(
+      (b) => picked.current.get(b.name.toLowerCase()) === b.id
+    )
+    const body = bots?.length
+      ? linkMentions(text.trim(), [...choices, ...bots])
+      : text.trim()
+    onSend((body + files).trim())
     attachments.forEach(dropThumb)
     setText("")
     setAttachments([])
+    picked.current.clear()
+  }
+
+  function choose(bot: MentionBot) {
+    if (!mention) return
+    const after = text.slice(caret).replace(/^ /, "")
+    const before = `${text.slice(0, mention.start)}@${bot.name} `
+    picked.current.set(bot.name.toLowerCase(), bot.id)
+    // Done with this @, whatever a late caret event says.
+    setDismissedAt(mention.start)
+    setText(before + after)
+    setCaret(before.length)
+    requestAnimationFrame(() => {
+      const el = textarea.current
+      if (!el) return
+      el.focus()
+      el.setSelectionRange(before.length, before.length)
+    })
   }
 
   function attach(files: FileList | File[] | null) {
@@ -330,7 +408,35 @@ export function Composer({
   }
 
   return (
-    <div className="mx-auto w-full max-w-[820px] px-6 pb-4">
+    <div className="relative mx-auto w-full max-w-[820px] px-6 pb-4">
+      {picking ? (
+        <ul
+          id="composer-mentions"
+          role="listbox"
+          aria-label="Bots"
+          className="absolute bottom-full left-6 z-10 mb-2 w-64 rounded-2xl bg-kumo-base p-1 shadow-[0_0_0_1px_var(--color-kumo-line),0_8px_24px_oklch(0_0_0/0.08)]"
+        >
+          {options.map((bot, i) => (
+            <li
+              key={bot.id}
+              id={`composer-mention-${bot.id}`}
+              role="option"
+              aria-selected={i === active}
+              data-active={i === active || undefined}
+              // Keep focus in the field, so the caret stays where it was.
+              onMouseDown={(e) => {
+                e.preventDefault()
+                choose(bot)
+              }}
+              onMouseEnter={() => setActive(i)}
+              className="flex cursor-pointer items-center gap-2 rounded-xl px-2.5 py-1.5 text-[14px] text-kumo-default data-active:bg-(--fill-hover)"
+            >
+              <BotAvatar avatar={bot.avatar} size={20} className="shrink-0" />
+              <span className="truncate">{bot.name}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <form
         onSubmit={(e) => {
           e.preventDefault()
@@ -429,13 +535,49 @@ export function Composer({
               attachments.length ? "Add a message" : `Message ${botName}`
             }
             aria-label={`Message ${botName}`}
-            onChange={(e) => setText(e.target.value)}
+            aria-autocomplete={bots?.length ? "list" : undefined}
+            aria-controls={picking ? "composer-mentions" : undefined}
+            aria-expanded={bots?.length ? picking : undefined}
+            aria-activedescendant={
+              picking ? `composer-mention-${options[active]?.id}` : undefined
+            }
+            onChange={(e) => {
+              const { value, selectionStart } = e.target
+              // A freshly typed @ opens the list, even where one was closed.
+              if (
+                value.length > text.length &&
+                value[selectionStart - 1] === "@"
+              ) {
+                setDismissedAt(null)
+              }
+              setText(value)
+              setCaret(selectionStart)
+            }}
+            onSelect={(e) => setCaret(e.currentTarget.selectionStart)}
             onPaste={(e) => {
               if (!onAttach || !e.clipboardData.files.length) return
               e.preventDefault()
               attach(e.clipboardData.files)
             }}
             onKeyDown={(e) => {
+              if (picking && !e.nativeEvent.isComposing) {
+                if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault()
+                  const step = e.key === "ArrowDown" ? 1 : -1
+                  setActive((active + step + options.length) % options.length)
+                  return
+                }
+                if ((e.key === "Enter" || e.key === "Tab") && !e.shiftKey) {
+                  e.preventDefault()
+                  choose(options[active] ?? options[0])
+                  return
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault()
+                  setDismissedAt(mention?.start ?? null)
+                  return
+                }
+              }
               if (
                 e.key === "Enter" &&
                 !e.shiftKey &&

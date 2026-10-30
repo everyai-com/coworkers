@@ -29,6 +29,10 @@ interface HubContextValue {
   live: boolean
   createBot: () => Promise<BotSummary>
   deleteBot: (botId: string) => Promise<void>
+  /** A bot that sets up and runs the others (onboarding). */
+  createChiefOfStaff: () => Promise<BotSummary>
+  /** Paused bots skip routines, check-ins, email, webhooks and bot messages. */
+  setPaused: (botId: string, paused: boolean) => Promise<void>
   markRead: (botId: string) => void
   /** A bot's newest reply, cut to the parts that wait on the user. */
   waitingParts: (botId: string) => Promise<UIMessage | null>
@@ -114,6 +118,11 @@ export function useHub() {
   return value
 }
 
+/** The hub where there may be none, for components used outside the app shell. */
+export function useOptionalHub() {
+  return useContext(HubContext)
+}
+
 interface ProviderProps {
   viewer: Viewer
   initial: HubState
@@ -137,6 +146,8 @@ export function StaticHubProvider({
       live: false,
       createBot: notConnected,
       deleteBot: notConnected,
+      createChiefOfStaff: notConnected,
+      setPaused: notConnected,
       markRead: () => {},
       waitingParts: notConnected,
       answerApproval: notConnected,
@@ -173,6 +184,9 @@ export function LiveHubProvider({ viewer, initial, children }: ProviderProps) {
       live: agent.state !== undefined,
       createBot: () => agent.stub.createBot(),
       deleteBot: (botId) => agent.stub.deleteBot(botId),
+      createChiefOfStaff: () => agent.stub.createChiefOfStaff(),
+      setPaused: (botId, paused) =>
+        paused ? agent.stub.pauseBot(botId) : agent.stub.resumeBot(botId),
       markRead: (botId) => void agent.stub.markRead(botId),
       waitingParts: (botId) => agent.stub.waitingParts(botId),
       answerApproval: (botId, approvalId, approved) =>

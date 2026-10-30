@@ -41,7 +41,6 @@ import type { AgentEmail } from "agents/email"
 import { jsonSchema, tool } from "ai"
 import type { JSONSchema7, ToolSet, UIMessage } from "ai"
 import PostalMime from "postal-mime"
-import { isModelId } from "@/lib/models"
 import type { ModelSettings } from "@/lib/models"
 import { z } from "zod"
 import {
@@ -111,6 +110,18 @@ import type { BrowserNav, FrameResult, SeenTab } from "./browser-frame"
 import { finishTeachingCode, startTeachingCode } from "./teach"
 import type { TeachRecording, TeachSession } from "./teach"
 import type { UserHub } from "./user-hub"
+import { MAX_BOT_FILES, updateBot as updateBotOperation } from "@/control/bots"
+import {
+  operationClasses,
+  operationTools,
+  runAsUser,
+} from "@/control/operations"
+import type {
+  BotPort,
+  BotSettingsPatch,
+  Caller,
+  HubPort,
+} from "@/control/operation"
 import { LoopGuard, shapeToolResults } from "./guards"
 import { failureCard, replyCard, scriptCard, waitingCard } from "./desk"
 import type { DemoBotSeed } from "./demo-seed"
@@ -178,8 +189,8 @@ const TOOL_CLASS: Record<string, ActionClass> = {
   browser_pdf: "browse",
   browser_crawl: "browse",
   browser_execute: "browser",
-  message_bot: "bots",
-  delegate_task: "bots",
+  // message_bot, delegate_task and the bot-management operations.
+  ...operationClasses(),
   secret_request: "apps",
   schedule_routine: "routines",
   update_routine: "routines",
@@ -217,11 +228,8 @@ const WATCH_SCRIPT_TIMEOUT_MS = 60_000
 const WATCH_SAMPLE_CHARS = 3_000
 /** Past this many app tools, the bot searches for tools instead of seeing all. */
 const LAZY_APP_TOOLS = 20
-/** Files one message_bot call can carry, and their combined size. */
-const MAX_BOT_FILES = 10
+/** Combined size of the files one message_bot call can carry. */
 const MAX_BOT_FILE_BYTES = 5 * 1024 * 1024
-/** A chain of bot-to-bot messages stops after this many bots. */
-const MAX_BOT_HOPS = 6
 /** Tools that only read: rerunning one after an interruption is harmless. */
 const READ_ONLY_TOOLS = new Set([
   "read",
@@ -882,6 +890,17 @@ export class BotAgent extends Think<Env, BotState> {
       })
       await this.internal_reconcileScheduledTasks()
     }
+    // Bots created before a rule class existed get its default.
+    if (
+      (Object.keys(DEFAULT_RULES) as ActionClass[]).some(
+        (cls) => !this.state.rules[cls]
+      )
+    ) {
+      this.setState({
+        ...this.state,
+        rules: { ...DEFAULT_RULES, ...this.state.rules },
+      })
+    }
     // Connections used to be registered on each bot; they live on the
     // UserHub now. Drop any leftovers so stale tokens are not kept here.
     for (const id of Object.keys(this.getMcpServers().servers)) {
@@ -900,9 +919,16 @@ export class BotAgent extends Think<Env, BotState> {
     this
       .sql`UPDATE script_runs SET status = 'detached' WHERE status = 'running'`
     if (this.openScripts().length) await this.ensureScriptPoll(1)
-    // The hub may still hold a status from before the restart. A bot the hub
-    // does not know yet (mid-create) is ignored there.
-    if (this.name) void this.report({ status: this.state.status })
+    // The hub may still hold a status from before the restart, and bots
+    // from before the directory listed jobs never reported theirs. A bot the
+    // hub does not know yet (mid-create) is ignored there.
+    if (this.name) {
+      void this.report({
+        status: this.state.status,
+        role: this.state.role,
+        ...(this.state.access ? { access: this.state.access } : {}),
+      })
+    }
   }
 
   /** Called once by the UserHub right after the bot is created. */
@@ -999,6 +1025,7 @@ export class BotAgent extends Think<Env, BotState> {
   private async checkIn(options: { key?: string; force?: boolean } = {}) {
     const p = this.state.proactive
     if (!options.force) {
+      if (this.state.paused) return
       if (!p.enabled || inQuietHours(p)) return
       if (this.proactiveToday() >= p.maxPerDay) return
       if (this.state.status !== "idle") return
@@ -1226,7 +1253,8 @@ export class BotAgent extends Think<Env, BotState> {
     if (toolName.endsWith("_unavailable") && this.#appToolNames.has(toolName))
       return "allow"
     const cls = this.#appToolNames.has(toolName) ? "apps" : TOOL_CLASS[toolName]
-    return cls ? this.state.rules[cls] : "allow"
+    // Bots from before a class existed get its default.
+    return cls ? (this.state.rules[cls] ?? DEFAULT_RULES[cls]) : "allow"
   }
 
   /**
@@ -1462,6 +1490,73 @@ export class BotAgent extends Think<Env, BotState> {
     return tools
   }
 
+  /** This bot as a caller of the shared operations (src/control/). */
+  private asCaller(): Caller {
+    return {
+      kind: "bot",
+      botId: this.botId,
+      level: this.state.access ?? "act",
+      rules: { ...DEFAULT_RULES, ...this.state.rules },
+      hops:
+        (metaOf(this.messages.findLast((m) => m.role === "user")).hops ?? 0) +
+        1,
+      background: this.isBackgroundTurn(),
+    }
+  }
+
+  /** The hub as operations see it. Settings for this bot stay local. */
+  private hubPort(): HubPort {
+    const hub = () => this.hub()
+    return {
+      hasBot: async (botId) => (await hub()).hasBot(botId),
+      listBots: async () => (await hub()).listBots(),
+      readBot: async (botId, limit) => (await hub()).readBot(botId, limit),
+      addBot: async () => (await hub()).addBot(),
+      setPaused: async (botId, paused) =>
+        (await hub()).setPaused(botId, paused),
+      removeBot: async (botId) => (await hub()).removeBot(botId),
+      configureBot: async (botId, patch) => {
+        if (botId !== this.botId)
+          return (await hub()).configureBot(botId, patch)
+        await this.applySettings(patch)
+        return true
+      },
+      relayMessage: async (...args) => (await hub()).relayMessage(...args),
+      delegateTask: async (...args) => (await hub()).delegateTask(...args),
+    }
+  }
+
+  /** This bot's side of bot-to-bot work, for message_bot and delegate_task. */
+  private botPort(): BotPort {
+    return {
+      readAttachments: (paths) => this.readAttachments(paths),
+      openDelegation: ({ taskId, to, task, hops, background }) => {
+        this.sql`INSERT OR IGNORE INTO delegations
+          (id, to_name, task, created_at, status, hops, background)
+          VALUES (${taskId}, ${to}, ${task}, ${Date.now()}, 'open', ${hops},
+                  ${background ? 1 : 0})`
+      },
+      confirmDelegation: (taskId, to) => {
+        this.sql`UPDATE delegations SET to_name = ${to} WHERE id = ${taskId}`
+      },
+      dropDelegation: (taskId) => {
+        this.sql`DELETE FROM delegations WHERE id = ${taskId}`
+      },
+    }
+  }
+
+  /** The operations this bot may call, as tools. */
+  private operationTools(): ToolSet {
+    return operationTools(this.asCaller(), (requestId, approved) => ({
+      // Built per call: hops and background belong to the current turn.
+      caller: this.asCaller(),
+      requestId,
+      approved,
+      hub: this.hubPort(),
+      self: this.botPort(),
+    }))
+  }
+
   private botTools(): ToolSet {
     return {
       set_name: tool({
@@ -1683,107 +1778,8 @@ export class BotAgent extends Think<Env, BotState> {
         },
       }),
 
-      message_bot: tool({
-        description:
-          "Send a message to another of the user's bots, to delegate work or pass on something it needs. It replies in its own thread.",
-        inputSchema: z.object({
-          to: z.string().describe("The other bot's name"),
-          message: z.string(),
-          files: z
-            .array(z.string())
-            .max(MAX_BOT_FILES)
-            .optional()
-            .describe(
-              "Your own files to send along (paths under /workspace). Each bot has its own computer, so the other bot cannot open your paths: attach the file instead. They are copied into its inbox."
-            ),
-        }),
-        execute: async ({ to, message, files = [] }, { toolCallId }) => {
-          const hops =
-            (metaOf(this.messages.findLast((m) => m.role === "user")).hops ??
-              0) + 1
-          if (hops > MAX_BOT_HOPS) {
-            return {
-              delivered: false,
-              error: `This conversation has already passed through ${MAX_BOT_HOPS} bots. Do not forward it again: finish the work yourself or tell the user.`,
-            }
-          }
-          const attachments = await this.readAttachments(files)
-          if ("error" in attachments) {
-            return { delivered: false, error: attachments.error }
-          }
-          const hub = await this.hub()
-          // Keyed on the tool call, so a recovered turn that re-runs this call
-          // does not deliver the message twice.
-          return hub.relayMessage(this.botId, to, message, {
-            key: `bot:${this.botId}:${toolCallId}`,
-            hops,
-            ...(attachments.files.length ? { files: attachments.files } : {}),
-          })
-        },
-      }),
-
-      delegate_task: tool({
-        description:
-          "Hand a piece of work to another of the user's bots and get its result back. Returns at once: the result arrives later as a new message, when that bot finishes. To split a job, delegate the parts to several bots in one step, then end your turn and combine the results as they come in.",
-        inputSchema: z.object({
-          to: z.string().describe("The other bot's name"),
-          task: z
-            .string()
-            .describe(
-              "Self-contained instructions: the goal, what you already know, and what to send back. The other bot has not seen this conversation."
-            ),
-          files: z
-            .array(z.string())
-            .max(MAX_BOT_FILES)
-            .optional()
-            .describe(
-              "Your own files it needs (paths under /workspace). They are copied into its inbox."
-            ),
-        }),
-        execute: async ({ to, task, files = [] }, { toolCallId }) => {
-          const hops =
-            (metaOf(this.messages.findLast((m) => m.role === "user")).hops ??
-              0) + 1
-          if (hops > MAX_BOT_HOPS) {
-            return {
-              delegated: false,
-              error: `This work has already passed through ${MAX_BOT_HOPS} bots. Do not hand it on again: finish it yourself or tell the user.`,
-            }
-          }
-          const attachments = await this.readAttachments(files)
-          if ("error" in attachments) {
-            return { delegated: false, error: attachments.error }
-          }
-          // Derived from the tool call, so a recovered turn that re-runs this
-          // call hands out the same task instead of a second one.
-          const taskId = `t${toolCallId.replace(/[^a-zA-Z0-9]/g, "").slice(-24)}`
-          const background = this.isBackgroundTurn()
-          this.sql`INSERT OR IGNORE INTO delegations
-            (id, to_name, task, created_at, status, hops, background)
-            VALUES (${taskId}, ${to}, ${task}, ${Date.now()}, 'open', ${hops},
-                    ${background ? 1 : 0})`
-          const hub = await this.hub()
-          const sent = await hub.delegateTask(this.botId, to, task, {
-            taskId,
-            key: `task:${this.botId}:${taskId}`,
-            hops,
-            background,
-            ...(attachments.files.length ? { files: attachments.files } : {}),
-          })
-          if (!sent.delivered) {
-            this.sql`DELETE FROM delegations WHERE id = ${taskId}`
-            return { delegated: false, error: sent.error }
-          }
-          this.sql`UPDATE delegations SET to_name = ${sent.to ?? to}
-            WHERE id = ${taskId}`
-          return {
-            delegated: true,
-            to: sent.to,
-            taskId,
-            note: "Its result arrives as a new message when it finishes. Do not wait or check on it.",
-          }
-        },
-      }),
+      // From the shared operations: message_bot, delegate_task.
+      ...this.operationTools(),
 
       attach_result_files: tool({
         description:
@@ -2475,7 +2471,7 @@ export class BotAgent extends Think<Env, BotState> {
     const queued = this.ctx.storage.kv.get<string[]>(key) ?? []
     this.ctx.storage.kv.delete(key)
     const app = this.apps.get(payload.slug)
-    if (!app) return
+    if (!app || this.state.paused) return
     // Errors from copies still running code the bot has since replaced.
     const events = queued.filter((line) => {
       const match = /^PAGE ERROR \(v(\d+)/.exec(line)
@@ -4229,6 +4225,14 @@ export class BotAgent extends Think<Env, BotState> {
       WHERE routine_id = ${payload.id} AND status = 'running'
         AND started_at > ${now - ROUTINE_OVERLAP_MS} LIMIT 1`
     const runId = crypto.randomUUID()
+    if (this.state.paused) {
+      this
+        .sql`INSERT INTO routine_runs (id, routine_id, name, started_at, finished_at, status, attempt, note)
+        VALUES (${runId}, ${payload.id}, ${payload.name}, ${now}, ${now}, 'skipped', ${attempt},
+                ${"The bot was paused."})`
+      this.trimRoutineRuns()
+      return
+    }
     if (busy.length) {
       // Two copies of one routine would report the same things twice.
       this
@@ -4764,6 +4768,8 @@ export class BotAgent extends Think<Env, BotState> {
       await this.workspace.fs.writeFile(`${dir}/${name}`, content)
       attachments.push(`${dir}/${name}`)
     }
+    // Kept in the inbox, but a paused bot does not act on it.
+    if (this.state.paused) return
     await this.submitAs(
       { kind: "email", name: sender },
       emailPrompt({
@@ -4798,6 +4804,8 @@ export class BotAgent extends Think<Env, BotState> {
       recursive: true,
     })
     await this.workspace.fs.writeFile(path, pretty)
+    // Kept in the inbox, but a paused bot does not act on it.
+    if (this.state.paused) return true
     await this.submitAs(
       { kind: "webhook", name: event.source },
       webhookPrompt({
@@ -4913,18 +4921,21 @@ export class BotAgent extends Think<Env, BotState> {
   // ── Browser-facing (settings and the Computer panel) ────────────────
 
   @callable()
-  async updateSettings(input: {
-    name?: string
-    role?: string
-    rules?: Partial<Record<ActionClass, RulePolicy>>
-    /** Null goes back to the account's model. */
-    model?: string | null
-  }) {
+  async updateSettings(input: BotSettingsPatch) {
+    await runAsUser(
+      updateBotOperation,
+      { hub: this.hubPort() },
+      { ...input, bot: this.botId }
+    )
+  }
+
+  /** Apply settings checked by the update_bot operation. */
+  async applySettings(input: BotSettingsPatch) {
+    const accessChanged =
+      input.access !== undefined &&
+      input.access !== (this.state.access ?? "act")
     const name = input.name?.trim()
     const model = input.model?.trim() || null
-    if (model && !isModelId(model)) {
-      throw new Error(`"${model}" is not a model id.`)
-    }
     this.setState({
       ...this.state,
       ...(input.model !== undefined ? { model } : {}),
@@ -4933,8 +4944,67 @@ export class BotAgent extends Think<Env, BotState> {
       ...(input.rules
         ? { rules: { ...this.state.rules, ...input.rules } }
         : {}),
+      ...(input.access ? { access: input.access } : {}),
     })
-    if (name) await this.report({ name })
+    await this.report({
+      ...(name ? { name } : {}),
+      ...(input.role !== undefined ? { role: this.state.role } : {}),
+      ...(input.access ? { access: input.access } : {}),
+    })
+    if (accessChanged) await this.noteAccessChange()
+  }
+
+  /**
+   * Put a change of access into the chat itself. The prompt says it too,
+   * but a model that already told the user "I can't" in this chat tends to
+   * believe its own earlier replies over its tool list.
+   */
+  private async noteAccessChange() {
+    // Mid-turn or waiting on an approval, a new message would break the
+    // turn: the prompt's "# Running the team" has to do on its own.
+    if (this.#turnActive || this.hasPendingApproval()) return
+    const manage = this.state.access === "manage"
+    const text = manage
+      ? '[Settings] The user turned on "Manage other bots" for you. From now on you have create_bot, update_bot, pause_bot, resume_bot and delete_bot. Anything you said earlier in this chat about not being able to do this is out of date.'
+      : '[Settings] The user turned off "Manage other bots" for you. You no longer have create_bot, update_bot, pause_bot, resume_bot or delete_bot.'
+    await this.addMessages([
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text }],
+        metadata: {
+          origin: {
+            kind: "settings",
+            name: manage
+              ? "Can now manage your other bots"
+              : "Can no longer manage your other bots",
+          },
+          at: Date.now(),
+        } satisfies MessageMeta,
+      },
+    ])
+  }
+
+  /** Durable Object RPC from the UserHub, which also marks it in the directory. */
+  async setPaused(paused: boolean) {
+    this.setState({ ...this.state, paused })
+  }
+
+  /** Durable Object RPC: this bot's latest messages, for another bot to read. */
+  async transcript(limit: number) {
+    const history = await this.session.getHistory()
+    return history
+      .filter((m) => m.role === "user" || m.role === "assistant")
+      .slice(-limit)
+      .map((m) => {
+        const at = metaOf(m as UIMessage).at
+        return {
+          role: m.role as "user" | "assistant",
+          ...(at ? { at: new Date(at).toISOString() } : {}),
+          text: clip(textOf(m as UIMessage), 1500),
+        }
+      })
+      .filter((m) => m.text.trim())
   }
 
   @callable()

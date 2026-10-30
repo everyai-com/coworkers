@@ -35,7 +35,12 @@ import { useBot } from "@/lib/bot-context"
 import { connectionStatus } from "@/lib/connection-status"
 import { useHub } from "@/lib/hub-context"
 import type { MemoryRevision } from "@/lib/hub-context"
-import { ACTION_CLASSES, CHECK_IN_HOURS, DEFAULT_PROACTIVE } from "@/lib/types"
+import {
+  ACTION_CLASSES,
+  CHECK_IN_HOURS,
+  DEFAULT_PROACTIVE,
+  DEFAULT_RULES,
+} from "@/lib/types"
 import type {
   SecretMeta,
   ActionClass,
@@ -168,6 +173,45 @@ function Model() {
         }}
         onChange={(model) => void agent?.stub.updateSettings({ model })}
       />
+    </Group>
+  )
+}
+
+function Access() {
+  const { botId, state, agent } = useBot()
+  const hub = useHub()
+  const paused = hub.state.bots.find((b) => b.id === botId)?.paused === true
+  return (
+    <Group
+      title="Access"
+      hint="What this bot may do beyond its own work. Its rules below still decide when it asks you first."
+    >
+      <Row
+        label="Manage other bots"
+        detail="Create, change, pause and delete your bots, following its Manage bots rule. Deleting always asks you."
+      >
+        <Switch
+          aria-label="Manage other bots"
+          checked={state.access === "manage"}
+          disabled={!agent}
+          onCheckedChange={(manage) =>
+            void agent?.stub.updateSettings({
+              access: manage ? "manage" : "act",
+            })
+          }
+        />
+      </Row>
+      <Row
+        label="Paused"
+        detail="Skips its routines, check-ins, email, webhooks and messages from other bots. You can still chat with it."
+      >
+        <Switch
+          aria-label="Paused"
+          checked={paused}
+          disabled={!hub.live}
+          onCheckedChange={(next) => void hub.setPaused(botId, next)}
+        />
+      </Row>
     </Group>
   )
 }
@@ -398,14 +442,17 @@ function Rules() {
       title="Rules"
       hint="“Ask first” pauses the work and shows an approval card. In background work nobody can approve, so those actions are skipped and reported instead."
     >
-      {ACTION_CLASSES.map((cls) => (
+      {ACTION_CLASSES.filter(
+        // Only bots that may manage others have a use for this rule.
+        (cls) => cls.id !== "manage" || state.access === "manage"
+      ).map((cls) => (
         <Row key={cls.id} label={cls.label} detail={cls.hint}>
           <Select
             aria-label={`${cls.label} rule`}
             size="sm"
             className="w-32 shrink-0"
             disabled={!agent}
-            value={state.rules[cls.id]}
+            value={state.rules[cls.id] ?? DEFAULT_RULES[cls.id]}
             items={POLICY_LABELS}
             onValueChange={(value) => {
               if (!value) return
@@ -943,6 +990,7 @@ export function SettingsPanel() {
     <div className="min-h-0 flex-1 space-y-8 overflow-y-auto px-4 pt-2 pb-6">
       <Identity />
       <Model />
+      <Access />
       <Spend />
       <OnItsOwn />
       <OpenItems />

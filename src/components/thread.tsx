@@ -7,7 +7,8 @@ import {
   useState,
 } from "react"
 import { useHydrated, useLocation } from "@tanstack/react-router"
-import Markdown from "react-markdown"
+import Markdown, { defaultUrlTransform } from "react-markdown"
+import type { Components } from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { Button } from "@cloudflare/kumo/components/button"
 import { Loader } from "@cloudflare/kumo/components/loader"
@@ -21,6 +22,7 @@ import {
   WebhooksLogoIcon,
 } from "@/components/icons"
 import { BotAvatar } from "@/components/bot-avatar"
+import { BotMention } from "@/components/bot-mention"
 import { CaptureCard } from "@/components/capture-card"
 import { CodeBlock } from "@/components/code-block"
 import { ComputerCard } from "@/components/computer-card"
@@ -38,6 +40,7 @@ import {
   toTurn,
 } from "@/lib/message-parts"
 import { useFollowBottom } from "@/lib/follow-bottom"
+import { botIdFromLink, splitMentions } from "@/lib/bot-links"
 import { NO_UPDATE } from "@/lib/types"
 import type { UIMessage } from "ai"
 import type { ReadFileData } from "@/components/capture-card"
@@ -138,65 +141,89 @@ const PROSE = [
   "[&_pre_code]:rounded-none [&_pre_code]:bg-transparent [&_pre_code]:p-0",
 ].join(" ")
 
+/** Keep bot links, which Markdown's default sanitizer would empty. */
+function urlTransform(url: string) {
+  return botIdFromLink(url) ? url : defaultUrlTransform(url)
+}
+
+/**
+ * Built once: a fresh object per render would give React new component
+ * types on every streamed chunk, remounting links (and restarting the bot
+ * faces in mention chips).
+ */
+const PROSE_COMPONENTS: Components = {
+  a: ({ node: _node, href, children, ...props }) => {
+    const botId = botIdFromLink(href)
+    if (botId) {
+      return (
+        <BotMention
+          botId={botId}
+          label={String(children ?? "")}
+          className="text-kumo-link"
+        />
+      )
+    }
+    const host = linkHost(href)
+    return (
+      <a
+        {...props}
+        href={href}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="font-medium text-kumo-link decoration-1 underline-offset-2 hover:underline"
+      >
+        {host ? <Favicon host={host} /> : null}
+        {children}
+      </a>
+    )
+  },
+  table: ({ node: _node, ...props }) => (
+    <div className="-mx-1 my-3 overflow-x-auto">
+      <table
+        {...props}
+        className="w-full border-collapse text-sm tabular-nums"
+      />
+    </div>
+  ),
+  th: ({ node: _node, style, ...props }) => (
+    <th
+      {...props}
+      style={style}
+      className="border-b border-kumo-line px-3 pt-1 pb-2 text-left align-bottom text-[13px] font-medium whitespace-nowrap text-kumo-subtle"
+    />
+  ),
+  td: ({ node: _node, style, ...props }) => (
+    <td
+      {...props}
+      style={style}
+      className="border-b border-kumo-line px-3 py-2.5 align-top [tr:last-child>&]:border-b-0"
+    />
+  ),
+  // Fenced blocks get highlighted; inline `code` stays a small chip.
+  pre: ({ children }) => <>{children}</>,
+  code: ({ node: _node, className, children, ...props }) => {
+    const text = String(children ?? "")
+    const lang = /language-([\w-]+)/.exec(className ?? "")?.[1]
+    if (!lang && !text.includes("\n")) return <code {...props}>{children}</code>
+    return (
+      <CodeBlock
+        code={text.replace(/\n$/, "")}
+        lang={lang}
+        className="rounded-2xl bg-(--fill-hover) px-4 py-3"
+      />
+    )
+  },
+}
+
+const REMARK_PLUGINS = [remarkGfm]
+
 export function Prose({ text }: { text: string }) {
   return (
     <div className={PROSE}>
       <Markdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ node: _node, href, children, ...props }) => {
-            const host = linkHost(href)
-            return (
-              <a
-                {...props}
-                href={href}
-                target="_blank"
-                rel="noreferrer noopener"
-                className="font-medium text-kumo-link decoration-1 underline-offset-2 hover:underline"
-              >
-                {host ? <Favicon host={host} /> : null}
-                {children}
-              </a>
-            )
-          },
-          table: ({ node: _node, ...props }) => (
-            <div className="-mx-1 my-3 overflow-x-auto">
-              <table
-                {...props}
-                className="w-full border-collapse text-sm tabular-nums"
-              />
-            </div>
-          ),
-          th: ({ node: _node, style, ...props }) => (
-            <th
-              {...props}
-              style={style}
-              className="border-b border-kumo-line px-3 pt-1 pb-2 text-left align-bottom text-[13px] font-medium whitespace-nowrap text-kumo-subtle"
-            />
-          ),
-          td: ({ node: _node, style, ...props }) => (
-            <td
-              {...props}
-              style={style}
-              className="border-b border-kumo-line px-3 py-2.5 align-top [tr:last-child>&]:border-b-0"
-            />
-          ),
-          // Fenced blocks get highlighted; inline `code` stays a small chip.
-          pre: ({ children }) => <>{children}</>,
-          code: ({ node: _node, className, children, ...props }) => {
-            const text = String(children ?? "")
-            const lang = /language-([\w-]+)/.exec(className ?? "")?.[1]
-            if (!lang && !text.includes("\n"))
-              return <code {...props}>{children}</code>
-            return (
-              <CodeBlock
-                code={text.replace(/\n$/, "")}
-                lang={lang}
-                className="rounded-2xl bg-(--fill-hover) px-4 py-3"
-              />
-            )
-          },
-        }}
+        remarkPlugins={REMARK_PLUGINS}
+        urlTransform={urlTransform}
+        components={PROSE_COMPONENTS}
       >
         {text}
       </Markdown>
@@ -676,9 +703,18 @@ function UserMessage({ message }: { message: UIMessage }) {
   }
   // Check-ins are invisible: only what the bot chose to say shows up.
   if (origin?.kind === "check-in") return null
+  if (origin?.kind === "settings") {
+    return <SystemEvent>{origin.name}</SystemEvent>
+  }
   return (
     <div className="ml-auto w-fit max-w-[75%] rounded-[22px] bg-kumo-contrast px-[18px] py-3 text-[15px] leading-[1.65] text-pretty whitespace-pre-wrap text-kumo-inverse">
-      {text}
+      {splitMentions(text).map((segment, i) =>
+        segment.kind === "bot" ? (
+          <BotMention key={i} botId={segment.botId} label={segment.label} />
+        ) : (
+          <Fragment key={i}>{segment.text}</Fragment>
+        )
+      )}
     </div>
   )
 }

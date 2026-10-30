@@ -427,15 +427,18 @@ function Desk() {
 function Onboarding() {
   const hub = useHub()
   const navigate = useNavigate()
-  const [creating, setCreating] = useState(false)
+  const [creating, setCreating] = useState<"blank" | "chief" | null>(null)
 
-  async function createBot() {
-    setCreating(true)
+  async function create(kind: "blank" | "chief") {
+    setCreating(kind)
     try {
-      const bot = await hub.createBot()
+      const bot =
+        kind === "chief"
+          ? await hub.createChiefOfStaff()
+          : await hub.createBot()
       await navigate({ to: "/bots/$botId", params: { botId: bot.id } })
     } finally {
-      setCreating(false)
+      setCreating(null)
     }
   }
 
@@ -462,18 +465,31 @@ function Onboarding() {
           and keeps working while you're away.
         </p>
       </div>
-      <Button
+      <div
+        className="flex flex-col items-center gap-3"
         style={{ "--i": 2 } as React.CSSProperties}
-        variant="primary"
-        size="lg"
-        className="btn-ink rounded-full"
-        icon={<PlusIcon />}
-        onClick={createBot}
-        loading={creating}
-        disabled={!hub.live}
       >
-        New bot
-      </Button>
+        <Button
+          variant="primary"
+          size="lg"
+          className="btn-ink rounded-full"
+          icon={<PlusIcon />}
+          onClick={() => void create("blank")}
+          loading={creating === "blank"}
+          disabled={!hub.live || creating !== null}
+        >
+          New bot
+        </Button>
+        <Button
+          variant="ghost"
+          className="rounded-full"
+          onClick={() => void create("chief")}
+          loading={creating === "chief"}
+          disabled={!hub.live || creating !== null}
+        >
+          Or start with a Chief of Staff who sets up the rest
+        </Button>
+      </div>
     </div>
   )
 }

@@ -11,6 +11,7 @@ import {
   CrawlIcon,
   EnvelopeSimpleIcon,
   EyeIcon,
+  GearSixIcon,
   MessageIcon,
   PipelineIcon,
   TerminalIcon,
@@ -34,6 +35,7 @@ const ORIGIN_ICONS: Record<DeskOrigin, React.ComponentType<IconProps>> = {
   bot: BotIcon,
   pipeline: PipelineIcon,
   chat: MessageIcon,
+  settings: GearSixIcon,
 }
 
 /** "just now", "12m", "3h", "Yesterday", "3 Oct". */

@@ -24,6 +24,7 @@ import { ApprovalPopover } from "@/components/approval-popover"
 import { BotAvatar } from "@/components/bot-avatar"
 import { EmptyState } from "@/components/empty-state"
 import { ShimmerText } from "@/components/shimmer-text"
+import { plainMentions } from "@/lib/bot-links"
 import { useHub } from "@/lib/hub-context"
 import { usePushNotifications } from "@/lib/push"
 import { useSwipeViews } from "@/lib/use-swipe-views"
@@ -111,7 +112,8 @@ function formatWhen(timestamp: number, now = new Date()) {
 
 function previewFor(bot: BotSummary) {
   if (bot.status === "action_needed") return "Needs you to continue"
-  return bot.preview || "No messages yet"
+  if (bot.paused) return "Paused"
+  return plainMentions(bot.preview) || "No messages yet"
 }
 
 function initials(label: string) {

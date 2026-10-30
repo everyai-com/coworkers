@@ -41,7 +41,19 @@ export interface BotSummary {
   preview: string
   updatedAt: number
   unread: boolean
+  /** What the bot is for. Reported by the bot; absent until it first does. */
+  role?: string
+  /** Paused bots skip routines, check-ins, email, webhooks and bot messages. */
+  paused?: boolean
+  /** Absent means "act". */
+  access?: AccessLevel
 }
+
+/**
+ * What a caller may do through the shared operations (`src/control/`):
+ * read, act (message, delegate, answer), or manage bots and settings.
+ */
+export type AccessLevel = "read" | "act" | "manage"
 
 /**
  * A user-level MCP connection (Executor or any MCP server). The UserHub holds
@@ -210,6 +222,11 @@ export const ACTION_CLASSES = [
     label: "Schedule routines",
     hint: "Create work that runs later",
   },
+  {
+    id: "manage",
+    label: "Manage bots",
+    hint: "Create, change and pause your other bots",
+  },
 ] as const
 export type ActionClass = (typeof ACTION_CLASSES)[number]["id"]
 
@@ -221,6 +238,7 @@ export const DEFAULT_RULES: Record<ActionClass, RulePolicy> = {
   apps: "ask",
   bots: "allow",
   routines: "allow",
+  manage: "ask",
 }
 
 export interface Routine {
@@ -355,6 +373,10 @@ export interface BotState {
   lastCheckIn?: number
   /** App calls from the bot's scripts, paused until the user answers. */
   scriptApprovals?: ScriptApproval[]
+  /** "manage" lets it run the user's other bots. Absent means "act". */
+  access?: AccessLevel
+  /** Routines, check-ins, email, webhooks and bot messages are skipped. */
+  paused?: boolean
 }
 
 /**
@@ -396,7 +418,9 @@ export interface MessageOrigin {
     | "crawl"
     | "pipeline"
     | "script"
-  /** Bot, routine or pipeline name, email sender, webhook source, app name, crawled host, or what a script was for. */
+    /** The user changed something the bot needs to know, like its access. */
+    | "settings"
+  /** Bot, routine or pipeline name, email sender, webhook source, app name, crawled host, what a script was for, or what changed in settings. */
   name: string
   avatar?: BotAvatarKind
 }

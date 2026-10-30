@@ -17,6 +17,7 @@ import {
 } from "@tanstack/react-router"
 import { useAgent } from "agents/react"
 import { useAgentChat } from "@cloudflare/think/react"
+import { Button } from "@cloudflare/kumo/components/button"
 import { Tooltip } from "@cloudflare/kumo/components/tooltip"
 import {
   GearSixIcon,
@@ -244,6 +245,12 @@ function LiveBot({
   })
   const state = agent.state ?? initialState
   const chat = useAgentChat({ agent })
+  const paused = hub.state.bots.find((b) => b.id === botId)?.paused === true
+  // Every other bot, for @mentions.
+  const mentionable = useMemo(
+    () => hub.state.bots.filter((b) => b.id !== botId),
+    [hub.state.bots, botId]
+  )
   const busy = chat.status === "submitted" || chat.status === "streaming"
 
   // Opening a thread clears its unread dot, including for replies that land
@@ -370,6 +377,23 @@ function LiveBot({
             "Something went wrong. Try sending that again."}
         </p>
       ) : null}
+      {paused ? (
+        <div className="mx-auto flex w-full max-w-[820px] items-center justify-between gap-3 px-6 pb-2 text-sm text-kumo-subtle">
+          <span className="text-pretty">
+            Paused. Its routines, check-ins, email, webhooks and messages from
+            other bots are skipped.
+          </span>
+          <Button
+            size="sm"
+            variant="secondary"
+            className="shrink-0 rounded-full"
+            disabled={!hub.live}
+            onClick={() => void hub.setPaused(botId, false)}
+          >
+            Resume
+          </Button>
+        </div>
+      ) : null}
       <Composer
         botName={state.name}
         busy={busy}
@@ -378,6 +402,7 @@ function LiveBot({
         }
         onStop={() => void chat.stop()}
         onAttach={onAttach}
+        bots={mentionable}
       />
     </BotLayout>
   )
