@@ -11,6 +11,7 @@ const DEPLOY_FILE = ["coworkers.deploy.json", "bdots.deploy.json"].find((f) =>
  * and kept out of git. Anything it leaves out uses the defaults below.
  */
 const deploy: Partial<{
+  accountId: string
   name: string
   model: string
   gateway: string
@@ -37,7 +38,13 @@ export default defineConfig({
     compatibilityDate: "2026-09-01",
     // No `experimental`: Cloudflare refuses to deploy Workers that set it
     // (error 10021), though @cloudflare/computer's README asks for it.
-    compatibilityFlags: ["nodejs_compat"],
+    // durable_object_io_tasks_prevent_eviction: a script (run_js) keeps its
+    // Durable Object in memory while it runs, so a long one is not evicted
+    // after a minute. It is the default from compatibility date 2026-10-01.
+    compatibilityFlags: [
+      "nodejs_compat",
+      "durable_object_io_tasks_prevent_eviction",
+    ],
     // Custom entry (not "@tanstack/react-start/server-entry") so the Worker
     // can export Durable Object classes and route /agents/* first.
     entrypoint: "./src/server.ts",
@@ -69,6 +76,10 @@ export default defineConfig({
       // Rendering - Edit" in .dev.vars / the deploy secrets file.
       BROWSER_RUN_ACCOUNT_ID: bindings.text(""),
       BROWSER_RUN_API_TOKEN: bindings.secret(),
+      // Optional: per-bot spend in Settings. Reads AI Gateway logs, which
+      // needs the account id and an API token with "AI Gateway Read".
+      ACCOUNT_ID: bindings.text(deploy.accountId ?? ""),
+      AI_GATEWAY_API_TOKEN: bindings.secret(),
       // Dynamic Workers: the bot's shell and sandboxed browser code.
       LOADER: bindings.workerLoader(),
       UserHub: bindings.durableObject({

@@ -26,6 +26,8 @@ import {
   FileZipIcon as FileZip,
   Globe02Icon as Globe,
   Image01Icon as Image,
+  InboxCheckIcon as InboxCheck,
+  InboxIcon as Inbox,
   LockIcon as Lock,
   Pdf01Icon as Pdf,
   WebDesign01Icon as WebDesign,
@@ -110,6 +112,8 @@ export const EyeIcon = icon(View, "EyeIcon")
 export const GearSixIcon = icon(Settings, "GearSixIcon")
 export const GlobeIcon = icon(Globe, "GlobeIcon")
 export const ImageIcon = icon(Image, "ImageIcon")
+export const InboxIcon = icon(Inbox, "InboxIcon")
+export const InboxCheckIcon = icon(InboxCheck, "InboxCheckIcon")
 export const LockIcon = icon(Lock, "LockIcon")
 export const ListBulletsIcon = icon(ListBullet, "ListBulletsIcon")
 export const MessageIcon = icon(Message, "MessageIcon")

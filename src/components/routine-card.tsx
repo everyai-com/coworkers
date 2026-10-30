@@ -214,7 +214,9 @@ export function RoutineCard({
                 title={
                   "url" in routine.watch
                     ? routine.watch.url
-                    : routine.watch.command
+                    : "script" in routine.watch
+                      ? routine.watch.script
+                      : routine.watch.command
                 }
               >
                 Watches for changes

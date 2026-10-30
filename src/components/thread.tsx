@@ -91,7 +91,9 @@ interface ThreadProps {
 
 export type OnScriptApproval = (
   approval: ScriptApproval,
-  approved: boolean
+  approved: boolean,
+  /** Also let the rest of this run use the same tool without asking. */
+  all?: boolean
 ) => Promise<void>
 
 /** Hostname of an absolute http(s) link, for its favicon. */
@@ -262,14 +264,14 @@ function ScriptApprovalCard({
   approval: ScriptApproval
   onScriptApproval?: OnScriptApproval
 }) {
-  const [answering, setAnswering] = useState<boolean | null>(null)
+  const [answering, setAnswering] = useState<"one" | "all" | "no" | null>(null)
   const [error, setError] = useState<string | null>(null)
-  async function answer(approved: boolean) {
+  async function answer(choice: "one" | "all" | "no") {
     if (!onScriptApproval) return
-    setAnswering(approved)
+    setAnswering(choice)
     setError(null)
     try {
-      await onScriptApproval(approval, approved)
+      await onScriptApproval(approval, choice !== "no", choice === "all")
     } catch (err) {
       setError(err instanceof Error ? err.message : "That did not go through.")
       setAnswering(null)
@@ -297,21 +299,38 @@ function ScriptApprovalCard({
             variant="primary"
             className="btn-ink rounded-full"
             disabled={answering !== null}
-            loading={answering === true}
-            onClick={() => void answer(true)}
+            loading={answering === "one"}
+            onClick={() => void answer("one")}
           >
             Approve
           </Button>
+          {approval.toolName ? (
+            <Button
+              variant="outline"
+              className="rounded-full"
+              disabled={answering !== null}
+              loading={answering === "all"}
+              onClick={() => void answer("all")}
+            >
+              Approve all
+            </Button>
+          ) : null}
           <Button
             variant="outline"
             className="rounded-full"
             disabled={answering !== null}
-            loading={answering === false}
-            onClick={() => void answer(false)}
+            loading={answering === "no"}
+            onClick={() => void answer("no")}
           >
             Reject
           </Button>
         </div>
+      ) : null}
+      {onScriptApproval && approval.toolName ? (
+        <p className="mt-2 text-xs text-kumo-subtle">
+          Approve all lets this script use {approval.tool} again without asking,
+          until it finishes.
+        </p>
       ) : null}
       {error ? (
         <p role="alert" className="mt-2 text-sm text-kumo-danger">

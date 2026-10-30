@@ -15,6 +15,7 @@ import {
   BellSlashIcon,
   BotIcon,
   GearSixIcon,
+  InboxIcon,
   MagnifyingGlassIcon,
   PipelineIcon,
   PlusIcon,
@@ -180,6 +181,58 @@ function BotRow({ bot, active }: { bot: BotSummary; active: boolean }) {
   )
 }
 
+/** The Desk: everything the bots brought to you, above the bots themselves. */
+function DeskRow() {
+  const { state } = useHub()
+  const active = useLocation({ select: (l) => l.pathname === "/" })
+  const desk = state.desk ?? []
+  const needs = desk.filter((c) => c.lane === "needs_you").length
+  const seenAt = state.deskSeenAt ?? Infinity
+  const fresh = desk.filter((c) => c.createdAt > seenAt).length
+  const subtitle = needs
+    ? `${needs} ${needs === 1 ? "thing needs" : "things need"} you`
+    : fresh
+      ? `${fresh} new`
+      : desk.length
+        ? "Nothing urgent"
+        : "All clear"
+  return (
+    <Link
+      to="/"
+      className={`${ROW} ${active ? "bg-(--fill-active)" : "hover:bg-(--fill-hover)"}`}
+    >
+      <span className="relative flex size-12 shrink-0 items-center justify-center rounded-2xl bg-(--fill-hover) text-kumo-default">
+        <InboxIcon size={22} />
+        {needs ? (
+          <span
+            className="unread-dot absolute -top-1 -right-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-kumo-warning px-1.5 text-[11px] font-semibold text-white tabular-nums ring-2 ring-kumo-canvas"
+            aria-hidden="true"
+          >
+            {needs}
+          </span>
+        ) : fresh && !active ? (
+          <span
+            className="unread-dot absolute -top-0.5 -right-0.5 size-3 rounded-full bg-kumo-danger ring-2 ring-kumo-canvas"
+            aria-hidden="true"
+          />
+        ) : null}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[15px] font-medium text-kumo-default">
+          Desk
+        </span>
+        <span
+          className={`block truncate text-sm ${
+            needs ? "text-kumo-warning" : "text-kumo-subtle"
+          }`}
+        >
+          {subtitle}
+        </span>
+      </span>
+    </Link>
+  )
+}
+
 /** A search pill with a round action button tucked in at the end. */
 function SearchPill({
   value,
@@ -261,6 +314,12 @@ function BotsView() {
         aria-label="Bots"
         className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto px-(--inset) pt-1"
       >
+        {!query && hub.state.bots.length ? (
+          <>
+            <DeskRow />
+            <div className="mx-2.5 my-1 h-px bg-kumo-line" />
+          </>
+        ) : null}
         {bots.map((bot) => (
           <BotRow key={bot.id} bot={bot} active={bot.id === botId} />
         ))}

@@ -73,11 +73,15 @@ export function ApprovalPopover({
     }
   }
 
-  async function answerScript(approval: ScriptApproval, approved: boolean) {
+  async function answerScript(
+    approval: ScriptApproval,
+    approved: boolean,
+    all = false
+  ) {
     setAnswering(approval.callId)
     setError(null)
     try {
-      await hub.answerScriptApproval(bot.id, approval, approved)
+      await hub.answerScriptApproval(bot.id, approval, approved, all)
       const rest =
         waiting?.scripts.filter((s) => s.callId !== approval.callId) ?? []
       setWaiting((w) => (w ? { ...w, scripts: rest } : w))
@@ -172,6 +176,18 @@ export function ApprovalPopover({
                 >
                   Approve
                 </Button>
+                {approval.toolName ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="rounded-full"
+                    disabled={answering !== null}
+                    title={`Let this script use ${approval.tool} again without asking, until it finishes`}
+                    onClick={() => void answerScript(approval, true, true)}
+                  >
+                    Approve all
+                  </Button>
+                ) : null}
                 <Button
                   size="sm"
                   variant="outline"

@@ -95,6 +95,92 @@ export interface HubState {
   pipelineRuns?: PipelineRun[]
   /** The deployment's own models and gateway, refreshed on every start. */
   deployment?: DeploymentModels
+  /**
+   * Model spend per bot, from AI Gateway logs. Null when the deployment has
+   * no AI_GATEWAY_API_TOKEN, so there is nothing to read it with.
+   */
+  spend?: SpendSummary | null
+  /** Open cards on the Desk, newest first. Absent on hubs created before it. */
+  desk?: DeskCard[]
+  /** Last time the user looked at the Desk, for "while you were away". */
+  deskSeenAt?: number
+}
+
+/**
+ * The Desk's three lanes: things waiting on the user, things a bot found on
+ * its own, and work that finished while they were away.
+ */
+export type DeskLane = "needs_you" | "fyi" | "done"
+
+/** What started the work behind a card, for its icon and "why" line. */
+export type DeskOrigin = MessageOrigin["kind"] | "chat"
+
+export interface DeskAction {
+  id: string
+  label: string
+  kind: "approve" | "approve_all" | "reject" | "open_chat"
+}
+
+/** A card as a bot sends it. The hub adds the status. */
+export interface DeskCardInput {
+  /** Stable per bot, e.g. `approval:<id>`, so a card is never posted twice. */
+  key: string
+  lane: DeskLane
+  origin: DeskOrigin
+  /** One line: what this is. */
+  title: string
+  /** Why it is here now: what the bot was doing, or what started it. */
+  why: string
+  /** What the bot found or did, as short Markdown. */
+  found: string
+  /** Arguments of a call waiting for approval, as pretty-printed JSON. */
+  detail?: string
+  sources: { label: string; url: string }[]
+  /** The first is the primary button. */
+  actions: DeskAction[]
+  refs: {
+    messageId?: string
+    approvalId?: string
+    script?: { runId: string; callId: string }
+  }
+  createdAt: number
+}
+
+export interface DeskCard extends DeskCardInput {
+  /** `<botId>:<key>`. */
+  id: string
+  botId: string
+  status: "open" | "acted" | "dismissed" | "snoozed"
+  snoozeUntil?: number
+}
+
+export interface SpendTotals {
+  /** US dollars, as AI Gateway priced the calls. */
+  cost: number
+  tokensIn: number
+  tokensOut: number
+  requests: number
+}
+
+/** Days are UTC: AI Gateway logs carry UTC times. */
+export interface SpendSummary {
+  /** Unix ms of the last successful read of the logs. */
+  syncedAt: number | null
+  /** Why the last read failed, if it did. */
+  error?: string
+  /** "YYYY-MM", UTC. */
+  month: string
+  total: { today: number; month: number }
+  /** This month, most expensive first. */
+  bots: {
+    botId: string
+    today: SpendTotals
+    month: SpendTotals
+    /** Of this month's cost, what check-ins, routines and email cost. */
+    background: number
+  }[]
+  /** Every bot together, one entry per UTC day, the last 30. */
+  days: { day: string; cost: number }[]
 }
 
 export type RulePolicy = "allow" | "ask" | "block"
@@ -150,8 +236,12 @@ export interface Routine {
   watch?: RoutineWatch
 }
 
-/** A cheap check a routine runs before waking the model. */
-export type RoutineWatch = { url: string } | { command: string }
+/**
+ * A cheap check a routine runs before waking the model: a page or API, a
+ * shell command, or a saved script (run_js) whose result is compared.
+ */
+export type RoutineWatch =
+  { url: string } | { command: string } | { script: string }
 
 /** How a bot works on its own between conversations. */
 export interface ProactiveSettings {
@@ -282,6 +372,8 @@ export interface ScriptApproval {
   /** App and tool, as the user knows them. */
   app: string
   tool: string
+  /** The tool as the bot names it; "Approve all" trusts it for the run. */
+  toolName: string
   /** The call's arguments, as pretty-printed JSON. */
   argsJson: string
   /** Unix ms when it started waiting. */

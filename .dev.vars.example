@@ -10,3 +10,7 @@ VAPID_PRIVATE_KEY=""
 # Optional: Browser Run API token (permission "Browser Rendering - Edit") for
 # the bot's crawl tool. Also set BROWSER_RUN_ACCOUNT_ID in cloudflare.config.ts.
 BROWSER_RUN_API_TOKEN=""
+
+# Optional: API token with "AI Gateway Read" for per-bot spend in Settings.
+# Uses accountId from coworkers.deploy.json.
+AI_GATEWAY_API_TOKEN=""

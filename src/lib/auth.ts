@@ -11,6 +11,19 @@ import { env } from "cloudflare:workers"
  */
 export const DEMO_USER_ID = "demo"
 
+/**
+ * Without Access, `/api/demo-profile?as=jane` switches this browser to a
+ * second local profile with seeded data, for demos; `?as=you` switches back.
+ */
+export const DEMO_PROFILE_COOKIE = "coworkers_profile"
+export const DEMO_PROFILES = { jane: { label: "Jane Austen" } } as const
+export type DemoProfile = keyof typeof DEMO_PROFILES
+
+export function demoProfileOf(request: Request): DemoProfile | null {
+  const value = cookie(request, DEMO_PROFILE_COOKIE)
+  return value && value in DEMO_PROFILES ? (value as DemoProfile) : null
+}
+
 export interface Identity {
   id: string
   email: string | null
@@ -33,7 +46,9 @@ function issuer() {
 }
 
 export async function identify(request: Request): Promise<Identity> {
-  if (!accessConfigured()) return { id: DEMO_USER_ID, email: null }
+  if (!accessConfigured()) {
+    return { id: demoProfileOf(request) ?? DEMO_USER_ID, email: null }
+  }
   const token =
     request.headers.get("Cf-Access-Jwt-Assertion") ??
     cookie(request, "CF_Authorization")

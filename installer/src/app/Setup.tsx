@@ -157,7 +157,7 @@ export function Setup({
     <div className="screen-in w-full max-w-[560px] space-y-8">
       <header className="space-y-1 px-1.5">
         <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">
-          Set up your bots
+          Set up your Coworkers
         </h1>
         <p className="text-sm text-kumo-subtle">
           Signed in as {state.user?.email}.{" "}

@@ -42,7 +42,8 @@ interface HubContextValue {
   answerScriptApproval: (
     botId: string,
     approval: ScriptApproval,
-    approved: boolean
+    approved: boolean,
+    all?: boolean
   ) => Promise<void>
   addConnection: (input: NewConnection) => Promise<Connection>
   removeConnection: (connectionId: string) => Promise<void>
@@ -55,6 +56,18 @@ interface HubContextValue {
   models: ModelsApi | null
   /** Chains of bots. Null until the hub WebSocket is up. */
   pipelines: PipelinesApi | null
+  /** Read the newest AI Gateway logs now. Null until the hub WebSocket is up. */
+  refreshSpend: (() => Promise<void>) | null
+  /** The Desk's cards. Null until the hub WebSocket is up. */
+  desk: DeskApi | null
+}
+
+export interface DeskApi {
+  /** Press a card's button (approve, reject). */
+  act: (cardId: string, actionId: string) => Promise<void>
+  dismiss: (cardIds: string[]) => Promise<void>
+  restore: (cardIds: string[]) => Promise<void>
+  markSeen: () => void
 }
 
 export interface PipelinesApi {
@@ -137,6 +150,8 @@ export function StaticHubProvider({
       sharedMemory: null,
       models: null,
       pipelines: null,
+      refreshSpend: null,
+      desk: null,
     }),
     [viewer, initial]
   )
@@ -163,12 +178,13 @@ export function LiveHubProvider({ viewer, initial, children }: ProviderProps) {
       answerApproval: (botId, approvalId, approved) =>
         agent.stub.answerApproval(botId, approvalId, approved),
       waitingScripts: (botId) => agent.stub.waitingScripts(botId),
-      answerScriptApproval: (botId, approval, approved) =>
+      answerScriptApproval: (botId, approval, approved, all) =>
         agent.stub.answerScriptApproval(
           botId,
           approval.runId,
           approval.callId,
-          approved
+          approved,
+          all
         ),
       addConnection: (input) => agent.stub.addConnection(input),
       removeConnection: (id) => agent.stub.removeConnection(id),
@@ -210,6 +226,17 @@ export function LiveHubProvider({ viewer, initial, children }: ProviderProps) {
                 agent.stub.answerPipelineStep(runId, approved),
               stop: (runId) => agent.stub.stopPipelineRun(runId),
               output: (runId, step) => agent.stub.pipelineOutput(runId, step),
+            }
+          : null,
+      refreshSpend:
+        agent.state !== undefined ? () => agent.stub.refreshSpend() : null,
+      desk:
+        agent.state !== undefined
+          ? {
+              act: (cardId, actionId) => agent.stub.actOnCard(cardId, actionId),
+              dismiss: (ids) => agent.stub.dismissCards(ids),
+              restore: (ids) => agent.stub.restoreCards(ids),
+              markSeen: () => void agent.stub.markDeskSeen(),
             }
           : null,
     }),

@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start"
 import { getRequest } from "@tanstack/react-start/server"
 import { getAgentByName } from "agents"
 import { env } from "cloudflare:workers"
-import { DEMO_USER_ID, identify } from "@/lib/auth"
+import { DEMO_PROFILES, DEMO_USER_ID, identify } from "@/lib/auth"
 import { SIDEBAR_COOKIE, parseWidths } from "@/lib/layout-context"
 import type { PanelWidths } from "@/lib/layout-context"
 import { botInstanceName } from "@/lib/types"
@@ -26,6 +26,9 @@ const DEMO_VIEWER = {
 async function viewerFromRequest(request: Request): Promise<Viewer> {
   const { id, email } = await identify(request)
   if (id === DEMO_USER_ID) return { id, ...DEMO_VIEWER }
+  if (id in DEMO_PROFILES) {
+    return { id, label: DEMO_PROFILES[id as keyof typeof DEMO_PROFILES].label }
+  }
   return { id, label: email ?? id }
 }
 

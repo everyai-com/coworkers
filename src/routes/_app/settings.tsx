@@ -4,11 +4,13 @@ import { ConnectionsSettings } from "@/components/connections-settings"
 import { SidebarSimpleIcon } from "@/components/icons"
 import { ModelsSettings } from "@/components/models-settings"
 import { SlidingTabs } from "@/components/sliding-tabs"
+import { SpendSettings } from "@/components/spend-settings"
 import { useLayout } from "@/lib/layout-context"
 
 const TABS = [
   { value: "models", label: "Models" },
   { value: "connections", label: "Connections" },
+  { value: "spend", label: "Spend" },
 ] as const
 
 type Tab = (typeof TABS)[number]["value"]
@@ -17,7 +19,9 @@ export const Route = createFileRoute("/_app/settings")({
   validateSearch: (
     search: Record<string, unknown>
   ): { tab?: Tab; error?: string } => ({
-    ...(search.tab === "connections" ? { tab: "connections" as const } : {}),
+    ...(search.tab === "connections" || search.tab === "spend"
+      ? { tab: search.tab }
+      : {}),
     // Set by the sign-in callback when an app's OAuth flow fails.
     ...(typeof search.error === "string" ? { error: search.error } : {}),
   }),
@@ -66,6 +70,8 @@ function Settings() {
           </div>
           {tab === "models" ? (
             <ModelsSettings />
+          ) : tab === "spend" ? (
+            <SpendSettings />
           ) : (
             <ConnectionsSettings error={error} />
           )}

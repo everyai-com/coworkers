@@ -9,6 +9,7 @@ import { Switch } from "@cloudflare/kumo/components/switch"
 import { CopyButton } from "@/components/copy-button"
 import { ModelPicker } from "@/components/model-picker"
 import { RoutineCard } from "@/components/routine-card"
+import { BotSpend } from "@/components/spend-settings"
 import {
   EmptyRow,
   FIELD,
@@ -169,6 +170,11 @@ function Model() {
       />
     </Group>
   )
+}
+
+function Spend() {
+  const { botId } = useBot()
+  return <BotSpend botId={botId} />
 }
 
 function OnItsOwn() {
@@ -937,6 +943,7 @@ export function SettingsPanel() {
     <div className="min-h-0 flex-1 space-y-8 overflow-y-auto px-4 pt-2 pb-6">
       <Identity />
       <Model />
+      <Spend />
       <OnItsOwn />
       <OpenItems />
       <Rules />

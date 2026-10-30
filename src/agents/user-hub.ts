@@ -12,6 +12,8 @@ import type {
   BotSummary,
   BotTask,
   Connection,
+  DeskCard,
+  DeskCardInput,
   HubState,
   Pipeline,
   PipelineDraft,
@@ -19,11 +21,23 @@ import type {
   PipelineRunStep,
   PipelineStep,
   PushSubscriptionData,
+  SpendSummary,
   TaskOutcome,
 } from "@/lib/types"
 import type { BotAgent } from "./bot-agent"
+import { demoSeed } from "./demo-seed"
+import { visibleCards } from "./desk"
 import { MAX_MEMORY_CHARS, appendFact } from "./memory"
-import { deploymentModels, languageModel } from "./models"
+import { deploymentModels, gatewayId, languageModel } from "./models"
+import {
+  LOGS_PER_PAGE,
+  advance,
+  afterFilter,
+  newLogs,
+  summarize,
+  tally,
+} from "./spend"
+import type { GatewayLog, SpendCursor, SpendRow } from "./spend"
 import {
   MAX_PIPELINE_INPUT_CHARS,
   delegationPrompt,
@@ -60,6 +74,13 @@ function clip(text: string, max: number) {
 function serverId(connectionId: string) {
   return `c${connectionId}`
 }
+
+/** How often new AI Gateway logs are read for the Spend page. */
+const SPEND_SYNC_S = 30 * 60
+/** Pages of 50 logs one sync reads before leaving the rest for the next. */
+const SPEND_MAX_PAGES = 40
+/** Daily spend rows older than this are dropped. */
+const SPEND_KEEP_DAYS = 62
 
 /**
  * One per user (instance name = user id). Owns the bot directory that powers
@@ -116,6 +137,29 @@ export class UserHub extends Agent<Env, HubState> {
       source TEXT NOT NULL,
       content TEXT NOT NULL
     )`
+    // Model spend per bot and UTC day, read back from AI Gateway logs.
+    this.sql`CREATE TABLE IF NOT EXISTS spend_daily (
+      day TEXT NOT NULL,
+      bot_id TEXT NOT NULL,
+      turn TEXT NOT NULL,
+      cost REAL NOT NULL,
+      tokens_in INTEGER NOT NULL,
+      tokens_out INTEGER NOT NULL,
+      requests INTEGER NOT NULL,
+      PRIMARY KEY (day, bot_id, turn)
+    )`
+    // Desk cards. State carries the open ones; `data` is the whole card.
+    this.sql`CREATE TABLE IF NOT EXISTS desk_cards (
+      id TEXT PRIMARY KEY,
+      bot_id TEXT NOT NULL,
+      lane TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      data TEXT NOT NULL
+    )`
+    this.refreshDesk()
+    await this.startSpend()
     // After an MCP sign-in completes, send the user back to Connections.
     this.mcp.configureOAuthCallback({
       customHandler: (result) => {
@@ -130,6 +174,153 @@ export class UserHub extends Agent<Env, HubState> {
       },
     })
     await this.restoreLegacyConnections()
+  }
+
+  // ── Spend ───────────────────────────────────────────────────────────
+
+  private spendAccess() {
+    const account = this.env.ACCOUNT_ID?.trim()
+    const token = this.env.AI_GATEWAY_API_TOKEN?.trim()
+    return account && token ? { account, token } : null
+  }
+
+  /** Sync on a schedule when the deployment can read the logs. */
+  private async startSpend() {
+    if (!this.spendAccess()) {
+      if (this.state.spend !== null)
+        this.setState({ ...this.state, spend: null })
+      return
+    }
+    if (!this.getSchedules().some((s) => s.callback === "syncSpend")) {
+      await this.scheduleEvery(SPEND_SYNC_S, "syncSpend")
+    }
+    if (!this.state.spend) {
+      this.setState({ ...this.state, spend: this.spendSummary(null) })
+      await this.schedule(5, "syncSpend")
+    }
+  }
+
+  #syncingSpend?: Promise<void>
+
+  /** Schedule callback: read new AI Gateway logs into spend_daily. */
+  async syncSpend() {
+    const access = this.spendAccess()
+    if (!access) return
+    this.#syncingSpend ??= this.readSpend(access.account, access.token).finally(
+      () => (this.#syncingSpend = undefined)
+    )
+    return this.#syncingSpend
+  }
+
+  private async readSpend(account: string, token: string) {
+    let cursor = this.ctx.storage.kv.get<SpendCursor>("spend_cursor") ?? null
+    const now = new Date()
+    // The first read starts at the beginning of the month.
+    const from =
+      cursor?.at ??
+      new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)
+      ).toISOString()
+    const bots = new Set(this.state.bots.map((b) => b.id))
+    let error: string | undefined
+    let more = false
+    try {
+      for (let page = 1; page <= SPEND_MAX_PAGES; page++) {
+        const url = new URL(
+          `https://api.cloudflare.com/client/v4/accounts/${account}/ai-gateway/gateways/${gatewayId(this.env)}/logs`
+        )
+        url.searchParams.set("per_page", String(LOGS_PER_PAGE))
+        url.searchParams.set("page", String(page))
+        url.searchParams.set("order_by", "created_at")
+        url.searchParams.set("order_by_direction", "asc")
+        url.searchParams.set("filters", afterFilter(from))
+        const res = await fetch(url, {
+          headers: { Authorization: `Bearer ${token}` },
+          signal: AbortSignal.timeout(20_000),
+        })
+        const body = (await res.json().catch(() => ({}))) as {
+          success?: boolean
+          result?: GatewayLog[]
+          errors?: { message?: string }[]
+        }
+        if (!res.ok || !body.success) {
+          throw new Error(
+            body.errors?.[0]?.message ?? `AI Gateway answered ${res.status}.`
+          )
+        }
+        const batch = body.result ?? []
+        const logs = newLogs(batch, cursor)
+        this.addSpend(tally(logs, bots))
+        cursor = advance(logs, cursor)
+        // Saved per page, so a failure later keeps what was read.
+        if (cursor) this.ctx.storage.kv.put("spend_cursor", cursor)
+        if (batch.length < LOGS_PER_PAGE) break
+        if (page === SPEND_MAX_PAGES) more = true
+      }
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err)
+      console.error("Reading AI Gateway logs failed", err)
+    }
+    const cutoff = new Date(Date.now() - SPEND_KEEP_DAYS * 86_400_000)
+      .toISOString()
+      .slice(0, 10)
+    this.sql`DELETE FROM spend_daily WHERE day < ${cutoff}`
+    this.setState({
+      ...this.state,
+      spend: this.spendSummary(
+        error ? (this.state.spend?.syncedAt ?? null) : Date.now(),
+        error
+      ),
+    })
+    // A big backlog is read over several runs.
+    if (more && !error) await this.schedule(60, "syncSpend")
+  }
+
+  private addSpend(rows: SpendRow[]) {
+    for (const r of rows) {
+      this
+        .sql`INSERT INTO spend_daily (day, bot_id, turn, cost, tokens_in, tokens_out, requests)
+        VALUES (${r.day}, ${r.botId}, ${r.turn}, ${r.cost}, ${r.tokensIn}, ${r.tokensOut}, ${r.requests})
+        ON CONFLICT(day, bot_id, turn) DO UPDATE SET cost = cost + excluded.cost,
+          tokens_in = tokens_in + excluded.tokens_in,
+          tokens_out = tokens_out + excluded.tokens_out,
+          requests = requests + excluded.requests`
+    }
+  }
+
+  private spendSummary(syncedAt: number | null, error?: string): SpendSummary {
+    const since = new Date(Date.now() - 31 * 86_400_000)
+      .toISOString()
+      .slice(0, 10)
+    const rows = this.sql<{
+      day: string
+      bot_id: string
+      turn: string
+      cost: number
+      tokens_in: number
+      tokens_out: number
+      requests: number
+    }>`SELECT * FROM spend_daily WHERE day >= ${since}`.map((r): SpendRow => ({
+      day: r.day,
+      botId: r.bot_id,
+      turn: r.turn === "background" ? "background" : "chat",
+      cost: r.cost,
+      tokensIn: r.tokens_in,
+      tokensOut: r.tokens_out,
+      requests: r.requests,
+    }))
+    return {
+      ...summarize(rows, Date.now()),
+      syncedAt,
+      ...(error ? { error } : {}),
+    }
+  }
+
+  /** Read the newest logs now, from the Spend page. */
+  @callable()
+  async refreshSpend() {
+    if (!this.spendAccess()) throw new Error("Spend is not set up.")
+    await this.syncSpend()
   }
 
   /** Remember the app's origin to build MCP OAuth callback URLs. */
@@ -207,6 +398,8 @@ export class UserHub extends Agent<Env, HubState> {
         await this.failStep(run.id, index, "Its bot was deleted.")
       }
     }
+    this.sql`DELETE FROM desk_cards WHERE bot_id = ${botId}`
+    this.refreshDesk()
     try {
       const bot = await this.bot(botId)
       await bot.destroy()
@@ -249,12 +442,15 @@ export class UserHub extends Agent<Env, HubState> {
     botId: string,
     runId: string,
     callId: string,
-    approved: boolean
+    approved: boolean,
+    all = false
   ) {
     if (!this.state.bots.some((b) => b.id === botId)) {
       throw new Error("No such bot.")
     }
-    await (await this.bot(botId)).answerScriptApproval(runId, callId, approved)
+    await (
+      await this.bot(botId)
+    ).answerScriptApproval(runId, callId, approved, all)
   }
 
   @callable()
@@ -510,6 +706,184 @@ export class UserHub extends Agent<Env, HubState> {
       ...patch,
       ...(touched ? { updatedAt: Date.now() } : {}),
     })
+  }
+
+  // ── Desk ────────────────────────────────────────────────────────────
+
+  private cardRows(where: "live" | { id: string }): DeskCard[] {
+    const rows =
+      where === "live"
+        ? this.sql<{ data: string; status: DeskCard["status"] }>`
+            SELECT data, status FROM desk_cards
+            WHERE status IN ('open', 'snoozed')`
+        : this.sql<{ data: string; status: DeskCard["status"] }>`
+            SELECT data, status FROM desk_cards WHERE id = ${where.id}`
+    return rows.map((r) => ({
+      ...(JSON.parse(r.data) as DeskCard),
+      status: r.status,
+    }))
+  }
+
+  /** Rebuild the Desk in state from SQL. */
+  private refreshDesk() {
+    const desk = visibleCards(this.cardRows("live"), Date.now())
+    if (JSON.stringify(desk) !== JSON.stringify(this.state.desk ?? [])) {
+      this.setState({ ...this.state, desk })
+    }
+  }
+
+  private insertCard(botId: string, input: DeskCardInput) {
+    const card: DeskCard = {
+      ...input,
+      id: `${botId}:${input.key}`,
+      botId,
+      status: "open",
+    }
+    const now = Date.now()
+    this.sql`INSERT INTO desk_cards
+      (id, bot_id, lane, status, created_at, updated_at, data)
+      VALUES (${card.id}, ${botId}, ${card.lane}, 'open', ${card.createdAt},
+              ${now}, ${JSON.stringify(card)})
+      ON CONFLICT (id) DO UPDATE SET data = excluded.data,
+        lane = excluded.lane, updated_at = excluded.updated_at
+      WHERE desk_cards.status = 'open'`
+  }
+
+  private setCardStatus(ids: string[], status: DeskCard["status"]) {
+    const now = Date.now()
+    for (const id of ids) {
+      this.sql`UPDATE desk_cards SET status = ${status}, updated_at = ${now}
+        WHERE id = ${id}`
+    }
+    // Closed cards are kept a month, for undo and later for feedback.
+    this.sql`DELETE FROM desk_cards WHERE status IN ('acted', 'dismissed')
+      AND updated_at < ${now - 30 * 24 * 60 * 60 * 1000}`
+  }
+
+  /** Durable Object RPC: a bot puts something on the Desk, once per key. */
+  async postCard(botId: string, input: DeskCardInput) {
+    if (!this.state.bots.some((b) => b.id === botId)) return
+    const id = `${botId}:${input.key}`
+    if (this.sql`SELECT 1 FROM desk_cards WHERE id = ${id}`.length) return
+    this.insertCard(botId, input)
+    this.refreshDesk()
+  }
+
+  /**
+   * Durable Object RPC: everything a bot is waiting on right now. Cards for
+   * approvals no longer in the list were answered or expired, so they close.
+   */
+  async syncWaiting(botId: string, inputs: DeskCardInput[]) {
+    if (!this.state.bots.some((b) => b.id === botId)) return
+    const live = new Set<string>()
+    for (const input of inputs) {
+      live.add(`${botId}:${input.key}`)
+      this.insertCard(botId, input)
+    }
+    const stale = this.sql<{ id: string }>`SELECT id FROM desk_cards
+      WHERE bot_id = ${botId} AND lane = 'needs_you' AND status = 'open'
+        AND (id LIKE ${`${botId}:approval:%`} OR id LIKE ${`${botId}:script:%`})`
+      .map((r) => r.id)
+      .filter((id) => !live.has(id))
+    this.setCardStatus(stale, "acted")
+    this.refreshDesk()
+  }
+
+  /** Press a card's button: approve or reject what it is waiting on. */
+  @callable()
+  async actOnCard(cardId: string, actionId: string) {
+    const card = this.cardRows({ id: cardId })[0]
+    const action = card?.actions.find((a) => a.id === actionId)
+    if (!card || card.status !== "open" || !action) {
+      throw new Error("That card is gone.")
+    }
+    if (action.kind === "open_chat") return
+    const approved = action.kind !== "reject"
+    try {
+      const bot = await this.bot(card.botId)
+      if (card.refs.approvalId) {
+        await bot.answerApproval(card.refs.approvalId, approved)
+      } else if (card.refs.script) {
+        await bot.answerScriptApproval(
+          card.refs.script.runId,
+          card.refs.script.callId,
+          approved,
+          action.kind === "approve_all"
+        )
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : ""
+      // Answered somewhere else first: the card was just out of date.
+      if (!/already answered|no longer waiting/i.test(message)) throw err
+    }
+    this.setCardStatus([cardId], "acted")
+    this.refreshDesk()
+  }
+
+  /** "Got it" on one card, or "Clear all" on a lane. */
+  @callable()
+  dismissCards(cardIds: string[]) {
+    this.setCardStatus(cardIds, "dismissed")
+    this.refreshDesk()
+  }
+
+  /** Undo a dismissal. */
+  @callable()
+  restoreCards(cardIds: string[]) {
+    const now = Date.now()
+    for (const id of cardIds) {
+      this.sql`UPDATE desk_cards SET status = 'open', updated_at = ${now}
+        WHERE id = ${id} AND status = 'dismissed'`
+    }
+    this.refreshDesk()
+  }
+
+  /** The user looked at the Desk; newer cards get the "new" marker. */
+  @callable()
+  markDeskSeen() {
+    this.setState({ ...this.state, deskSeenAt: Date.now() })
+  }
+
+  /**
+   * Durable Object RPC from /api/demo-profile: replace the local "jane"
+   * profile's bots, chats and Desk with fresh demo data.
+   */
+  async seedDemo() {
+    if (this.userId !== "jane") {
+      throw new Error("Demo data only goes in the local demo profile.")
+    }
+    for (const bot of [...this.state.bots]) await this.deleteBot(bot.id)
+    this.sql`DELETE FROM desk_cards`
+    const now = Date.now()
+    const seed = demoSeed(now)
+    for (const bot of seed.bots) {
+      await (await this.bot(bot.id)).seedDemo(bot)
+    }
+    const bots: BotSummary[] = seed.bots.map((b) => {
+      const last = b.messages.findLast((m) => m.role === "assistant")
+      const text = last?.parts.find((p) => p.type === "text")
+      return {
+        id: b.id,
+        name: b.name,
+        avatar: b.avatar,
+        status: "idle",
+        preview: clip(
+          (text?.type === "text" ? text.text : "")
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+            .replace(/[`*_#>|]+/g, "")
+            .replace(/\s+/g, " ")
+            .trim(),
+          140
+        ),
+        updatedAt: (last?.metadata as { at?: number } | undefined)?.at ?? now,
+        unread: b.unread,
+      }
+    })
+    // Cards from the last 50 minutes count as new.
+    this.setState({ ...this.state, bots, deskSeenAt: now - 50 * 60_000 })
+    for (const { botId, card } of seed.cards) this.insertCard(botId, card)
+    this.refreshDesk()
+    await this.setSharedMemory(seed.sharedMemory)
   }
 
   // ── Models ──────────────────────────────────────────────────────────

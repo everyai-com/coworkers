@@ -322,11 +322,12 @@ function LiveBot({
   )
 
   const onScriptApproval = useCallback<OnScriptApproval>(
-    (approval, approved) =>
+    (approval, approved, all) =>
       agent.stub.answerScriptApproval(
         approval.runId,
         approval.callId,
-        approved
+        approved,
+        all
       ),
     [agent]
   )

@@ -64,6 +64,7 @@ import type {
   BotStatus,
   BotTask,
   BrowserFrame,
+  DeskCardInput,
   MessageMeta,
   MessageOrigin,
   OpenItem,
@@ -111,6 +112,8 @@ import { finishTeachingCode, startTeachingCode } from "./teach"
 import type { TeachRecording, TeachSession } from "./teach"
 import type { UserHub } from "./user-hub"
 import { LoopGuard, shapeToolResults } from "./guards"
+import { failureCard, replyCard, scriptCard, waitingCard } from "./desk"
+import type { DemoBotSeed } from "./demo-seed"
 import { MAX_MEMORY_CHARS, appendFact } from "./memory"
 import { languageModel, pickModel } from "./models"
 import {
@@ -132,6 +135,7 @@ export { WorkspaceServiceProxy }
 
 const WORKSPACE_DIRS = [
   "inbox",
+  "scripts",
   "drafts",
   "artifacts",
   "downloads",
@@ -139,6 +143,25 @@ const WORKSPACE_DIRS = [
   "skills",
   "apps",
 ] as const
+
+/** A routine's watch, as the model describes it. */
+const WATCH_INPUT = z.union([
+  z.object({
+    url: z.string().describe("A public http(s) page or API to fetch"),
+  }),
+  z.object({
+    command: z
+      .string()
+      .describe("A shell command whose output to compare, e.g. a curl | jq"),
+  }),
+  z.object({
+    script: z
+      .string()
+      .describe(
+        "A JavaScript file under /workspace/scripts whose default export returns what to compare. Test it with run_js first."
+      ),
+  }),
+])
 
 /** Which rule governs each built-in tool. Tools not listed are always allowed. */
 const TOOL_CLASS: Record<string, ActionClass> = {
@@ -188,6 +211,8 @@ const SCRIPT_TIMEOUT_MS = 10 * 60_000
 const SCRIPT_GRACE_MS = 15 * 60_000
 /** How often detached scripts are checked on, and resumed after a restart. */
 const SCRIPT_POLL_S = 60
+/** A routine's watch script gets this long before the check counts as failed. */
+const WATCH_SCRIPT_TIMEOUT_MS = 60_000
 /** How much of a watched output is kept and shown to the model, in characters. */
 const WATCH_SAMPLE_CHARS = 3_000
 /** Past this many app tools, the bot searches for tools instead of seeing all. */
@@ -600,6 +625,8 @@ export class BotAgent extends Think<Env, BotState> {
   /** The user's Coworkers origin, from the hub each turn. Empty until known. */
   #origin = ""
   #reports: Promise<void> = Promise.resolve()
+  /** Desk updates, in order, like reports. */
+  #desk: Promise<void> = Promise.resolve()
   /** Shell commands share one backend, so they run one at a time. */
   #shell: Promise<unknown> = Promise.resolve()
   #loopGuard = new LoopGuard()
@@ -670,6 +697,68 @@ export class BotAgent extends Think<Env, BotState> {
     if (this.state.status === status) return
     this.setState({ ...this.state, status })
     await this.report({ status })
+  }
+
+  /** Put a card on the user's Desk. The hub keeps one per key. */
+  private postCard(card: DeskCardInput) {
+    this.#desk = this.#desk.then(async () => {
+      try {
+        const hub = await this.hub()
+        await hub.postCard(this.botId, card)
+      } catch (err) {
+        console.error("postCard failed", err)
+      }
+    })
+  }
+
+  /** Mirror everything this bot is waiting on onto the Desk. */
+  private syncDesk() {
+    this.#desk = this.#desk.then(async () => {
+      try {
+        const hub = await this.hub()
+        await hub.syncWaiting(this.botId, this.waitingCards())
+      } catch (err) {
+        console.error("syncWaiting failed", err)
+      }
+    })
+  }
+
+  private waitingCards(): DeskCardInput[] {
+    const cards: DeskCardInput[] = []
+    for (const message of this.messages) {
+      if (message.role !== "assistant") continue
+      for (const part of message.parts) {
+        const approvalId = pendingApprovalId(part)
+        if (!approvalId) continue
+        const p = part as { type: string; toolName?: string; input?: unknown }
+        cards.push(
+          waitingCard({
+            approvalId,
+            name:
+              p.type === "dynamic-tool"
+                ? (p.toolName ?? "")
+                : p.type.replace(/^tool-/, ""),
+            input: (p.input ?? {}) as Record<string, unknown>,
+            messageId: message.id,
+            said: textOf(message),
+            at:
+              this.ctx.storage.kv.get<number>(`approval_at:${approvalId}`) ??
+              metaOf(message).at ??
+              Date.now(),
+          })
+        )
+      }
+    }
+    for (const approval of this.state.scriptApprovals ?? []) {
+      cards.push(scriptCard(approval))
+    }
+    return cards
+  }
+
+  /** Someone has this bot's chat open right now. */
+  private watched() {
+    for (const _ of this.getConnections()) return true
+    return false
   }
 
   /** Push to the user's devices, unless it is their quiet time. */
@@ -834,6 +923,31 @@ export class BotAgent extends Think<Env, BotState> {
     await this.report({ preview: GREETING })
     // Browser sessions that outlive their idle window are reclaimed here.
     await this.scheduleEvery(30 * 60, "sweepBrowser")
+  }
+
+  /** Durable Object RPC from UserHub.seedDemo: a demo bot and its history. */
+  async seedDemo(seed: DemoBotSeed) {
+    await this.setup(seed.avatar)
+    this.setState({
+      ...this.state,
+      name: seed.name,
+      role: seed.role,
+      status: "idle",
+      lastCheckIn: Date.now() - 9 * 60_000,
+    })
+    // Seeded bots have no real connections: no check-ins mid-demo.
+    await this.updateProactive({
+      enabled: false,
+      timezone: "America/Los_Angeles",
+    })
+    await this.addMessages(seed.messages)
+    for (const item of seed.openItems) {
+      this.sql`INSERT INTO open_items
+        (id, title, note, source_url, created_at, updated_at, check_after, status)
+        VALUES (${crypto.randomUUID().slice(0, 6)}, ${item.title}, ${item.note},
+                ${null}, ${item.at}, ${item.at}, ${item.checkAfter ?? null}, 'open')`
+    }
+    await this.setMemory(seed.memory)
   }
 
   // ── Working on its own ──────────────────────────────────────────────
@@ -1720,25 +1834,9 @@ export class BotAgent extends Think<Env, BotState> {
             .describe(
               "Only message the user about things not reported on an earlier run, and stay quiet otherwise. Use it for routines that run more than daily, or when the user wants changes only. Each run is told how to track what it reported, so the prompt does not need to explain it."
             ),
-          watch: z
-            .union([
-              z.object({
-                url: z
-                  .string()
-                  .describe("A public http(s) page or API to fetch"),
-              }),
-              z.object({
-                command: z
-                  .string()
-                  .describe(
-                    "A shell command whose output to compare, e.g. a curl | jq"
-                  ),
-              }),
-            ])
-            .optional()
-            .describe(
-              "For 'tell me when X changes': checked before each run without using the model. The first check records a baseline, unchanged output skips the run, and a change runs you with the before and after."
-            ),
+          watch: WATCH_INPUT.optional().describe(
+            "For 'tell me when X changes': checked before each run without using the model. The first check records a baseline, unchanged output skips the run, and a change runs you with the before and after."
+          ),
         }),
         execute: async ({ name, prompt, cron, at, onlyNew, watch }) => {
           if (!cron === !at) {
@@ -1766,22 +1864,7 @@ export class BotAgent extends Think<Env, BotState> {
           cron: z.string().optional(),
           at: z.string().optional(),
           onlyNew: z.boolean().optional(),
-          watch: z
-            .union([
-              z.object({
-                url: z
-                  .string()
-                  .describe("A public http(s) page or API to fetch"),
-              }),
-              z.object({
-                command: z
-                  .string()
-                  .describe(
-                    "A shell command whose output to compare, e.g. a curl | jq"
-                  ),
-              }),
-            ])
-            .nullable()
+          watch: WATCH_INPUT.nullable()
             .optional()
             .describe(
               "Pass null to stop watching. For 'tell me when X changes': checked before each run without using the model. The first check records a baseline, unchanged output skips the run, and a change runs you with the before and after."
@@ -2837,13 +2920,16 @@ export class BotAgent extends Think<Env, BotState> {
     if (mode === "read" && !t.readOnly) {
       throw new Error(`${name} can change things, so use call() for it.`)
     }
-    const policy = this.scriptAppPolicy(t.readOnly)
+    const policy = this.scriptAppPolicy(
+      t.readOnly,
+      ctx.callId.startsWith("watch_")
+    )
     if (policy === "block") {
       throw new Error(
         `The user's rules do not allow ${t.connectionName} here. Do not retry.`
       )
     }
-    if (policy === "ask") {
+    if (policy === "ask" && !this.scriptTrusts(ctx.callId, name)) {
       // Everything above runs again when the answer arrives, so it must
       // stay free of side effects.
       const answer = await ctx.interrupt<{
@@ -2851,6 +2937,7 @@ export class BotAgent extends Think<Env, BotState> {
         expired?: boolean
       }>({
         kind: "app",
+        name,
         app: t.connectionName,
         tool: t.name,
         args: input,
@@ -2870,10 +2957,25 @@ export class BotAgent extends Think<Env, BotState> {
     return JSON.parse(JSON.stringify(result ?? null)) as WorkspaceRuntimeValue
   }
 
+  /**
+   * Whether the user chose "Approve all" for this tool in this run. A host
+   * call's id is "<run id>:<seq>", so the run is known without a lookup.
+   */
+  private scriptTrusts(callId: string, toolName: string) {
+    const runId = callId.slice(0, callId.lastIndexOf(":"))
+    return (
+      this.ctx.storage.kv
+        .get<string[]>(`script_trust:${runId}`)
+        ?.includes(toolName) === true
+    )
+  }
+
   /** decide() for an app call from a script, which has no tool name of its own. */
-  private scriptAppPolicy(readOnly: boolean): RulePolicy {
+  private scriptAppPolicy(readOnly: boolean, watch = false): RulePolicy {
     const policy = this.state.rules.apps
-    if (policy === "block" || !this.isBackgroundTurn()) return policy
+    // A routine's watch runs with nobody there, like a background turn.
+    if (policy === "block" || (!watch && !this.isBackgroundTurn()))
+      return policy
     if (readOnly || this.state.proactive.appsInBackground === true)
       return "allow"
     return policy === "ask" ? "block" : "allow"
@@ -2992,6 +3094,7 @@ export class BotAgent extends Think<Env, BotState> {
     }
     this.sql`UPDATE script_runs SET status = 'done', finished_at = ${Date.now()}
       WHERE id = ${id}`
+    this.ctx.storage.kv.delete(`script_trust:${id}`)
     if ("error" in outcome) {
       return {
         run: id,
@@ -3027,6 +3130,7 @@ export class BotAgent extends Think<Env, BotState> {
     if (row?.status !== "detached") return
     this.sql`UPDATE script_runs SET status = 'done', finished_at = ${Date.now()}
       WHERE id = ${id}`
+    this.ctx.storage.kv.delete(`script_trust:${id}`)
     const outcome: ScriptOutcome =
       "lost" in result
         ? result
@@ -3128,6 +3232,7 @@ export class BotAgent extends Think<Env, BotState> {
     const approvals = pending.flatMap((call) => {
       const p = call.payload as {
         kind?: string
+        name?: string
         app?: string
         tool?: string
         args?: Record<string, unknown>
@@ -3142,6 +3247,7 @@ export class BotAgent extends Think<Env, BotState> {
           purpose: row?.purpose ?? "",
           app: String(p.app ?? ""),
           tool: String(p.tool ?? ""),
+          toolName: String(p.name ?? ""),
           argsJson: JSON.stringify(p.args ?? {}, null, 2),
           since: call.since,
         },
@@ -3160,6 +3266,7 @@ export class BotAgent extends Think<Env, BotState> {
           : "idle"
       this.setState({ ...this.state, scriptApprovals: approvals, status })
       void this.report({ status })
+      this.syncDesk()
     }
     return approvals
   }
@@ -3173,7 +3280,34 @@ export class BotAgent extends Think<Env, BotState> {
 
   /** Answer a script's paused app call, from the thread or the sidebar. */
   @callable()
-  async answerScriptApproval(runId: string, callId: string, approved: boolean) {
+  async answerScriptApproval(
+    runId: string,
+    callId: string,
+    approved: boolean,
+    all = false
+  ) {
+    const approval = (this.state.scriptApprovals ?? []).find(
+      (a) => a.callId === callId
+    )
+    // "Approve all": the rest of this run may use this tool without asking,
+    // including any other calls to it already waiting.
+    const answering = [callId]
+    if (approved && all && approval?.toolName) {
+      const trusted =
+        this.ctx.storage.kv.get<string[]>(`script_trust:${runId}`) ?? []
+      this.ctx.storage.kv.put(`script_trust:${runId}`, [
+        ...new Set([...trusted, approval.toolName]),
+      ])
+      for (const a of this.state.scriptApprovals ?? []) {
+        if (
+          a.runId === runId &&
+          a.toolName === approval.toolName &&
+          a.callId !== callId
+        ) {
+          answering.push(a.callId)
+        }
+      }
+    }
     try {
       await this.workspace.runtime.respond(
         runId,
@@ -3188,9 +3322,15 @@ export class BotAgent extends Think<Env, BotState> {
       }
       throw err
     }
+    for (const other of answering.slice(1)) {
+      await this.workspace.runtime
+        .respond(runId, other, { approved: true }, { backend: "js" })
+        .catch(() => undefined)
+    }
     this
       .sql`UPDATE script_runs SET answered_at = ${Date.now()} WHERE id = ${runId}`
-    this.ctx.storage.kv.delete(`script_reminded:${callId}`)
+    for (const id of answering)
+      this.ctx.storage.kv.delete(`script_reminded:${id}`)
     await this.syncScriptApprovals()
     // It resumes now; make sure its result is watched and reported.
     this.scriptResult(runId).catch(() => undefined)
@@ -3372,6 +3512,7 @@ export class BotAgent extends Think<Env, BotState> {
       status,
       ...(background ? { lastCheckIn: Date.now() } : {}),
     })
+    this.syncDesk()
 
     // Nothing worth saying: drop the turn so it neither shows up nor
     // fills the context. Deleting re-parents anything that came after.
@@ -3413,6 +3554,29 @@ export class BotAgent extends Think<Env, BotState> {
     // found on its own, anything blocked on them, and long jobs finishing.
     const longTurn =
       this.#turnStartedAt > 0 && Date.now() - this.#turnStartedAt > LONG_TURN_MS
+    // The same goes on the Desk. A task's result goes back to whoever asked.
+    const origin = metaOf(trigger).origin
+    if (!waiting && !task && result.status === "completed") {
+      const card =
+        background && origin
+          ? replyCard({
+              messageId: result.message.id,
+              origin: origin.kind,
+              name: origin.name,
+              text: final,
+              at: Date.now(),
+            })
+          : !background && longTurn && !this.watched()
+            ? replyCard({
+                messageId: result.message.id,
+                origin: "chat",
+                name: textOf(trigger),
+                text: finalText(result.message),
+                at: Date.now(),
+              })
+            : null
+      if (card) this.postCard(card)
+    }
     if (waiting) {
       const question = result.message.parts.find(
         (p) => p.type === "tool-ask_user" && pendingApprovalId(p)
@@ -3553,6 +3717,8 @@ export class BotAgent extends Think<Env, BotState> {
     if (this.state.status === "action_needed" && !this.needsUser()) {
       await this.setStatus("idle")
     }
+    // Answered, expired or moved past: the Desk follows.
+    this.syncDesk()
   }
 
   // ── Secrets ─────────────────────────────────────────────────────────
@@ -3769,6 +3935,7 @@ export class BotAgent extends Think<Env, BotState> {
     await think._enqueueInteractionApply(() =>
       think._applyToolApproval(toolCallId, approved)
     )
+    this.syncDesk()
     if (!this.hasPendingApproval()) {
       await think._queueConnectionlessContinuation()
     }
@@ -4152,7 +4319,12 @@ export class BotAgent extends Think<Env, BotState> {
       return { status: "baseline", note: "First check: saved as the baseline." }
     if (previous.fingerprint === fingerprint)
       return { status: "unchanged", note: "No change since the last check." }
-    const what = "url" in watch ? watch.url : `\`${watch.command}\``
+    const what =
+      "url" in watch
+        ? watch.url
+        : "script" in watch
+          ? `the result of ${watch.script}`
+          : `\`${watch.command}\``
     return {
       status: "changed",
       note: `\n\nThis run was started because ${what} changed since the last check.\nBefore:\n${previous.sample}\n\nNow:\n${clip(output, WATCH_SAMPLE_CHARS)}`,
@@ -4178,6 +4350,7 @@ export class BotAgent extends Think<Env, BotState> {
             .replace(/<[^>]+>/g, " ")
         : text
     }
+    if ("script" in watch) return this.runWatchScript(watch.script)
     const run = this.#shell.then(async () => {
       const handle = await this.workspace.runtime.exec(watch.command, {
         encoding: "utf8",
@@ -4194,6 +4367,45 @@ export class BotAgent extends Think<Env, BotState> {
     })
     this.#shell = run.catch(() => undefined)
     return run
+  }
+
+  /**
+   * A routine's watch script: its default export's result is what gets
+   * compared. No model, no approval: it fails rather than waits.
+   */
+  private async runWatchScript(path: string): Promise<string> {
+    if (!path.startsWith(`${WORKSPACE_ROOT}/`) || !/\.m?js$/.test(path)) {
+      throw new Error("A watch script must be a .js file under /workspace.")
+    }
+    try {
+      await this.workspace.fs.stat(path)
+    } catch {
+      throw new Error(`${path} does not exist.`)
+    }
+    const slash = path.lastIndexOf("/")
+    const handle = await this.workspace.runtime.exec(
+      `export { default } from ${JSON.stringify(`./${path.slice(slash + 1)}`)}`,
+      {
+        backend: "js",
+        id: `watch_${crypto.randomUUID().slice(0, 8)}`,
+        cwd: path.slice(0, slash),
+        encoding: "utf8",
+        timeoutMs: WATCH_SCRIPT_TIMEOUT_MS,
+        onInterrupt: "fail",
+        output: { maxBytes: 16 * 1024, maxLines: 400 },
+      }
+    )
+    try {
+      const { exitCode, stdout, stderr, value } = await handle.result()
+      if (exitCode !== 0) {
+        throw new Error(`exit ${exitCode}: ${clip(stderr || stdout, 200)}`)
+      }
+      return value === undefined || value === null
+        ? stdout
+        : JSON.stringify(value, null, 2)
+    } finally {
+      handle[Symbol.dispose]()
+    }
   }
 
   private trimRoutineRuns() {
@@ -4279,9 +4491,19 @@ export class BotAgent extends Think<Env, BotState> {
         })}.`
       : ""
     const notice = `Routine **${row.name}** failed: ${error}${when}`
+    const noticeId = crypto.randomUUID()
+    this.postCard(
+      failureCard({
+        runId: run.runId,
+        name: row.name,
+        error: `${error}${when}`,
+        messageId: noticeId,
+        at: now,
+      })
+    )
     await this.addMessages([
       {
-        id: crypto.randomUUID(),
+        id: noticeId,
         role: "assistant",
         parts: [{ type: "text", text: notice }],
         metadata: {

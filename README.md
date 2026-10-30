@@ -60,7 +60,8 @@ flowchart LR
 | Take over      | Bot hands you its browser to sign in. You click **I'm done**, it continues   |
 | Your apps      | Calls tools on connected MCP servers or Executor                             |
 | Rules          | Per action type: allow, ask first, or block                                  |
-| Routines       | Cron or one-off jobs. Can watch a URL/command and only wake when it changes   |
+| Routines       | Cron or one-off jobs. Can watch a URL, command or saved script and only wake when it changes |
+| Spend          | What each bot cost this month and today, chat vs background, read from AI Gateway logs |
 | Check-ins      | Wakes every few hours, speaks only if something's worth saying             |
 | Memory         | Its own memory + one shared across all your bots. Both have version history  |
 | Open items     | Tracks things it's waiting on until they're resolved                         |
@@ -301,6 +302,7 @@ Set in `cloudflare.config.ts`. Everything has a working default.
 | `QUICK_ACTION_ENGINE`    | `kitesurf` (cheaper) or `chromium` for quick page reads                |
 | `EMAIL_DOMAIN`           | Turns on inbound email. Each bot gets `<user>.<bot>@<domain>`         |
 | `BROWSER_RUN_ACCOUNT_ID` | With `BROWSER_RUN_API_TOKEN` (secret), turns on the crawl tool        |
+| `AI_GATEWAY_API_TOKEN`   | Secret with "AI Gateway Read": per-bot spend in Settings. Uses `accountId` from the deploy file |
 | `VAPID_*`                | Push notification keys (`npx web-push generate-vapid-keys`)           |
 
 The Models page overrides `MODEL` and `BACKGROUND_MODEL` for your account,
